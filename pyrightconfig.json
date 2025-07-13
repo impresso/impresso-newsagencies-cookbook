@@ -1,0 +1,8 @@
+{
+  "include": ["lib/**/*.py", "cookbook/lib/**/*.py"],
+  "exclude": ["**/node_modules", "**/__pycache__", "**/*.pyc"],
+  "reportMissingImports": true,
+  "reportUnusedImports": true,
+  "reportMissingTypeStubs": true,
+  "typeCheckingMode": "basic"
+}

@@ -1,0 +1,25 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+
+[packages]
+
+smart-open= {extras = ["s3","http"], version = "==6.4"}
+requests = "*"
+dotenv = "*"
+boto3 = "==1.35.95"
+boto3-stubs = "==1.35.95"
+check-jsonschema = "*"
+impresso-cookbook = {editable = true, path = "./cookbook/lib",version="1.0.3"}
+pipenv = "*"
+python-dotenv = "*"
+
+
+[dev-packages]
+ipykernel = "*"
+
+
+[requires]
+python_version = "3.11"

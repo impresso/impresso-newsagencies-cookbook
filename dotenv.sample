@@ -1,0 +1,4 @@
+# Set the values accordingly
+# store as `.env` file
+SE_ACCESS_KEY=<YOUR VALUE>
+SE_SECRET_KEY=<YOUR VALUE>
