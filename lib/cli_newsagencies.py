@@ -180,9 +180,9 @@ class ChunkAwareTokenClassification(Pipeline):
             non_empty_texts,
             return_tensors="pt",
             truncation=True,
-            padding="longest",
+            padding="max_length",
             max_length=self.tokenizer.model_max_length,
-            stride=50,
+            stride=64,
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
             return_attention_mask=True,
@@ -209,6 +209,26 @@ class ChunkAwareTokenClassification(Pipeline):
             )
         logits = outputs.logits  # [num_chunks, seq_len, num_labels]
         log.debug("Model inference complete. Processing entities...")
+
+        # Debug: Log raw model output statistics
+        log.debug("Raw logits shape: %s", logits.shape)
+        log.debug("Available labels: %s", list(self.model.config.id2label.values()))
+
+        # Sample a few predictions to see what the model is producing
+        sample_chunk_idx = 0 if logits.size(0) > 0 else None
+        if sample_chunk_idx is not None:
+            sample_logits = logits[sample_chunk_idx]  # [seq_len, num_labels]
+            sample_probs = F.softmax(sample_logits, dim=-1)
+            sample_predictions = torch.argmax(sample_probs, dim=-1)
+
+            log.debug("=== SAMPLE RAW MODEL OUTPUT ===")
+            log.debug("Chunk %s predictions (first 10 tokens):", sample_chunk_idx)
+            for i in range(min(10, sample_logits.size(0))):
+                pred_idx = int(sample_predictions[i])
+                pred_label = self.model.config.id2label[pred_idx]
+                pred_conf = float(sample_probs[i, pred_idx])
+                log.debug("  Token %s: %s (%.4f)", i, pred_label, pred_conf)
+            log.debug("=== END SAMPLE OUTPUT ===")
 
         # Bring tensor inputs back to CPU for postprocess
         offset_mapping = encodings["offset_mapping"].cpu()
@@ -244,6 +264,19 @@ class ChunkAwareTokenClassification(Pipeline):
             for tok, m, offs, logit in zip(tokens, mask, offsets, seq_logits):
                 if m.item() == 0 or tok in {"[CLS]", "[SEP]", "[PAD]"}:
                     continue
+
+                # Debug: Log subtoken-level output similar to newsagencies_pipeline.py
+                if log.isEnabledFor(logging.DEBUG):
+                    probs = F.softmax(logit, dim=-1)
+                    sorted_idx = torch.argsort(probs, descending=True)
+                    prob_str = ", ".join(
+                        f"'{self.model.config.id2label[int(i)]}':{probs[i]:.3f}"
+                        for i in sorted_idx
+                        if probs[i] > 0.001
+                    )
+                    start, stop = offs.tolist()
+                    log.debug(f"Sub-token '{tok}' @({start},{stop}) → {prob_str}")
+
                 start, end = offs.tolist()
                 if not tok.startswith("##"):
                     # finalize previous token
@@ -322,22 +355,11 @@ class ChunkAwareTokenClassification(Pipeline):
         start = offsets[0][0]
         end = offsets[-1][1]
 
-        log.debug("Word: '%s' | Label: %s | Score: %.3f", word, label, conf)
-        log.debug("Span: [%s, %s]", start, end)
-
         if label == "O" or conf < self.min_score:
-            log.debug(
-                "Skipping word '%s': label=%s, score=%.3f, threshold=%s",
-                word,
-                label,
-                conf,
-                self.min_score,
-            )
             return
 
         key = (start, end, label)
         if key in seen[sample_idx]:
-            log.debug("Duplicate entity '%s' at [%s, %s]", word, start, end)
             return
         seen[sample_idx].add(key)
 
@@ -389,7 +411,7 @@ class NewsAgenciesPipeline:
         self.ner = ChunkAwareTokenClassification(
             model=model,
             tokenizer=tokenizer,
-            min_score=min_relevance,
+            min_score=min_relevance,  # Use the same threshold as pipeline
             device=device,
         )
         log.info("Pipeline initialization complete")
@@ -486,13 +508,28 @@ class NewsAgenciesPipeline:
         log.debug("Input text length: %s characters", len(input_text))
         log.debug("Diagnostics mode: %s", diagnostics)
 
+        # Debug: Log all raw entities to see what we're getting
+        if entities:
+            log.debug("Raw entities sample (first 3): %s", entities[:3])
+            unique_labels = set(ent["entity"] for ent in entities)
+            log.debug("Unique entity labels found: %s", unique_labels)
+
         # Merge B/I tokens into entities
         merged: List[Dict[str, Any]] = []
         current: Optional[Dict[str, Any]] = None
         suppressed_count = 0
 
         for tok in entities:
-            iob, base = tok["entity"].split("-", 1)
+            entity_label = tok["entity"]
+
+            # Handle different IOB formats
+            if "-" in entity_label:
+                iob, base = entity_label.split("-", 1)
+            else:
+                # Fallback: assume no IOB tagging, treat as B-tag
+                iob = "B"
+                base = entity_label
+
             if base in SUPPRESS:
                 suppressed_count += 1
                 log.debug("Suppressing entity type: %s", base)
@@ -673,6 +710,9 @@ class NewsAgencyProcessor:
         skipped_count = 0
         total_chunks_processed = 0
 
+        # Track entity types across all processed texts
+        entity_type_counts = {}  # entity_type -> count
+
         # Adaptive estimation - learns from actual tokenization results
         estimation_history = []  # Store (char_count, actual_chunks) pairs
         chars_per_token_ratio = 4.0  # Starting conservative estimate for French OCR
@@ -687,7 +727,7 @@ class NewsAgencyProcessor:
             if tokens <= 512:
                 return 1
             # Account for stride overlap when calculating chunks
-            return ((tokens - 512) // (512 - 50)) + 1
+            return ((tokens - 512) // (512 - 64)) + 1
 
         def update_estimation(char_count: int, actual_chunks: int) -> None:
             """Update estimation parameters based on actual results"""
@@ -706,8 +746,8 @@ class NewsAgencyProcessor:
                 if total_chunks > 0:
                     # Estimate chars per chunk, then derive chars per token
                     chars_per_chunk = total_chars / total_chunks
-                    # Each chunk ~= 462 effective tokens (512 - 50 overlap)
-                    new_ratio = chars_per_chunk / 462
+                    # Each chunk ~= 448 effective tokens (512 - 64 overlap)
+                    new_ratio = chars_per_chunk / 448
 
                     # Smooth the update to avoid oscillation
                     chars_per_token_ratio = (
@@ -723,7 +763,7 @@ class NewsAgencyProcessor:
                     )
 
         def process_batch(batch_items):
-            nonlocal processed_count, skipped_count, total_chunks_processed
+            nonlocal processed_count, skipped_count, total_chunks_processed, entity_type_counts
             if not batch_items:
                 return
 
@@ -788,6 +828,13 @@ class NewsAgencyProcessor:
                 )
 
                 if result.get("agencies"):
+                    # Count entity types for statistics
+                    for agency in result.get("agencies", []):
+                        entity_type = agency.get("uid", "unknown")
+                        entity_type_counts[entity_type] = (
+                            entity_type_counts.get(entity_type, 0) + 1
+                        )
+
                     result["ts"] = self.timestamp
                     result["id"] = data["content_id"]
                     log.debug("Writing result for content %s", data["content_id"])
@@ -1014,6 +1061,22 @@ class NewsAgencyProcessor:
             skipped_count,
         )
         log.info(final_msg)
+
+        # Report entity type statistics
+        if entity_type_counts:
+            log.info("📈 ENTITY TYPE SUMMARY:")
+            total_entities = sum(entity_type_counts.values())
+            log.info("   Total entities found: %s", total_entities)
+
+            # Sort entity types by count (descending)
+            sorted_entities = sorted(
+                entity_type_counts.items(), key=lambda x: x[1], reverse=True
+            )
+            for entity_type, count in sorted_entities:
+                percentage = (count / total_entities) * 100 if total_entities > 0 else 0
+                log.info("   %s: %s entities (%.1f%%)", entity_type, count, percentage)
+        else:
+            log.info("📈 ENTITY TYPE SUMMARY: No entities found")
 
         log.info("📊 PERFORMANCE SUMMARY:")
         log.info("   Total processing time: %.2f seconds", total_duration)
