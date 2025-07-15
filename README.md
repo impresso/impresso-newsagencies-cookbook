@@ -137,13 +137,17 @@ LOGGING_LEVEL=INFO
 
 ### Optional Processing Variables
 
-These can be set in `.env` or passed as command arguments:
+These can be set in `.env` as shell variables (propagate to make) or passed as command
+arguments to make:
 
 - `NEWSPAPER`: Target newspaper to process
 - `BUILD_DIR`: Local build directory (default: `build.d`)
-- `PARALLEL_JOBS`: Number of parallel jobs (auto-detected)
-- `COLLECTION_JOBS`: Number of parallel newspaper collections
-- `NEWSPAPER_YEAR_SORTING`: Processing order (`shuf` for random, `cat` for chronological)
+- `NEWSPAPER_YEAR_SORTING`: Processing order (`shuf` for random, `cat` for
+  chronological) of the years within a newspaper
+- `NPROC`: Number of CPU cores (auto-detected if not set)
+- `NEWSPAPER_JOBS`: Number of parallel jobs per newspaper processing (derived: NPROC ÷ COLLECTION_JOBS)
+- `COLLECTION_JOBS`: Number of newspapers to process in parallel within a collection (default: 2)
+- `MAX_LOAD`: Maximum system load (default: NPROC)
 
 ### S3 Bucket Configuration
 
