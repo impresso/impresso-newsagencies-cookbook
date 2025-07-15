@@ -30,7 +30,7 @@ CONFIG_LOCAL_MAKE ?= config.local.mk
 
 #: Show help message
 help::
-	@echo "Makefile for TEMPLATE processing"
+	@echo "Makefile for myprocessing processing"
 	@echo "Usage: make <target>"
 	@echo "Targets:"
 
@@ -52,8 +52,8 @@ include cookbook/setup.mk
 include cookbook/setup_python.mk
 # for asw tool configuration if needed
 # include cookbook/setup_aws.mk
-# for TEMPLATE configuration, adapt to your needs
-include cookbook/setup_TEMPLATE.mk
+# for myprocessing configuration, adapt to your needs
+include cookbook/setup_myprocessing.mk
 
 # Load newspaper list configuration and processing rules
 include cookbook/newspaper_list.mk
@@ -62,7 +62,7 @@ include cookbook/newspaper_list.mk
 # SETUP PATHS
 # include all path makefile snippets for s3 collection directories that you need
 include cookbook/paths_rebuilt.mk
-include cookbook/paths_TEMPLATE.mk
+include cookbook/paths_myprocessing.mk
 
 
 # MAIN TARGETS
@@ -72,14 +72,14 @@ include cookbook/main_targets.mk
 # SYNCHRONIZATION TARGETS
 include cookbook/sync.mk
 include cookbook/sync_rebuilt.mk
-include cookbook/sync_TEMPLATE.mk
+include cookbook/sync_myprocessing.mk
 
 include cookbook/clean.mk
 
 
 # PROCESSING TARGETS
 include cookbook/processing.mk
-include cookbook/processing_TEMPLATE.mk
+include cookbook/processing_myprocessing.mk
 
 
 # FUNCTION
