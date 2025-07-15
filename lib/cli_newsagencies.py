@@ -701,9 +701,7 @@ class NewsAgencyProcessor:
         )
         log.info("Using chunk-aware batching with target_chunks=%s", self.target_chunks)
 
-        batch_size = 8  # Target batch size (fallback)
         target_chunks = self.target_chunks  # Use configurable target chunks
-        read_ahead_size = batch_size * 100  # Read 800 lines ahead for sorting
 
         line_count = 0
         processed_count = 0
@@ -844,31 +842,22 @@ class NewsAgencyProcessor:
                     log.debug("No agencies found for %s, skipping", data["content_id"])
                     skipped_count += 1
 
+        # Read all data at once and sort by text length
+        log.info("Reading all data from %s...", self.input_file)
+        all_items = []
+
         try:
             with smart_open(
                 self.input_file,
                 "r",
                 encoding="utf-8",
                 transport_params=get_transport_params(self.input_file),
-            ) as f, smart_open(
-                self.output_file,
-                "w",
-                encoding="utf-8",
-                transport_params=get_transport_params(self.output_file),
-            ) as output_stream:
-
-                pending_items = []
-
+            ) as f:
                 for line in f:
                     line_count += 1
-                    log.debug("Processing line %s", line_count)
-
                     data = json.loads(line.strip())
                     input_text = data.get("ft", "")
                     content_id = data.get("id", data.get("c_id", ""))
-
-                    log.debug("Content ID: %s", content_id)
-                    log.debug("Text length: %s characters", len(input_text))
 
                     # Skip empty texts immediately at input stage
                     if len(input_text.strip()) == 0:
@@ -876,8 +865,8 @@ class NewsAgencyProcessor:
                         skipped_count += 1
                         continue
 
-                    # Add to pending items
-                    pending_items.append(
+                    # Only keep essential fields to minimize memory usage
+                    all_items.append(
                         {
                             "text": input_text,
                             "content_id": content_id,
@@ -885,161 +874,101 @@ class NewsAgencyProcessor:
                         }
                     )
 
-                    # When we have enough items, sort by length and process in batches
-                    if len(pending_items) >= read_ahead_size:
+                    if line_count % 10000 == 0:
                         log.info(
-                            "Read-ahead buffer full: %s items collected, "
-                            "starting length-based processing",
-                            len(pending_items),
+                            "Read %s lines, collected %s valid items",
+                            line_count,
+                            len(all_items),
                         )
 
-                        # Sort by text length for optimal batching
-                        pending_items.sort(key=lambda x: x["length"])
+            log.info(
+                "Completed reading %s lines, collected %s valid items",
+                line_count,
+                len(all_items),
+            )
+            log.info(
+                "Sorting %s items by text length for optimal batching...",
+                len(all_items),
+            )
 
-                        # Log length distribution for debugging
-                        lengths = [item["length"] for item in pending_items]
-                        min_len, max_len = min(lengths), max(lengths)
+            # Sort all items by text length for optimal GPU batching
+            all_items.sort(key=lambda x: x["length"])
+
+            # Log length distribution
+            if all_items:
+                lengths = [item["length"] for item in all_items]
+                min_len, max_len = min(lengths), max(lengths)
+                median_len = lengths[len(lengths) // 2]
+                log.info(
+                    "Text length range: %s - %s chars (median: %s)",
+                    min_len,
+                    max_len,
+                    median_len,
+                )
+
+            log.info("🚀 ENTERING CHUNK-AWARE BATCHING SECTION")
+            log.info("Target chunks per batch: %s", target_chunks)
+
+            # Process all items in chunk-aware batches
+            with smart_open(
+                self.output_file,
+                "w",
+                encoding="utf-8",
+                transport_params=get_transport_params(self.output_file),
+            ) as output_stream:
+                current_batch = []
+                current_chunks = 0
+                batch_count = 0
+
+                log.info(
+                    "Starting chunk-aware batching with target=%s chunks", target_chunks
+                )
+
+                for i, item in enumerate(all_items):
+                    item_chunks = estimate_chunks(item["text"])
+
+                    if i % 1000 == 0 and i > 0:
                         log.debug(
-                            "Text length range: %s - %s chars (sorted %s items)",
-                            min_len,
-                            max_len,
-                            len(pending_items),
-                        )
-
-                        log.info("🚀 ENTERING CHUNK-AWARE BATCHING SECTION")
-                        log.info("Target chunks per batch: %s", target_chunks)
-
-                        # Process in chunk-aware batches
-                        current_batch = []
-                        current_chunks = 0
-                        batch_count = 0
-
-                        log.info(
-                            "Starting chunk-aware batching with target=%s chunks",
-                            target_chunks,
-                        )
-
-                        for i, item in enumerate(pending_items):
-                            item_chunks = estimate_chunks(item["text"])
-
-                            log.debug(
-                                "Item %s: %s chars → %s chunks (current: %s)",
-                                i,
-                                item["length"],
-                                item_chunks,
-                                current_chunks,
-                            )
-
-                            # If adding this item would exceed target chunks,
-                            # process current batch
-                            if (
-                                current_batch
-                                and current_chunks + item_chunks > target_chunks
-                            ):
-                                batch_count += 1
-                                log.info(
-                                    "🔥 CHUNK LIMIT: batch %s with %s texts → %s"
-                                    " chunks "
-                                    "(would be %s with next item)",
-                                    batch_count,
-                                    len(current_batch),
-                                    current_chunks,
-                                    current_chunks + item_chunks,
-                                )
-                                process_batch(current_batch)
-                                current_batch = [item]
-                                current_chunks = item_chunks
-                                log.debug(
-                                    "Started new batch with item %s (%s chunks)",
-                                    i,
-                                    item_chunks,
-                                )
-                            else:
-                                current_batch.append(item)
-                                current_chunks += item_chunks
-                                log.debug(
-                                    "Added item %s to batch (total: %s texts, %s"
-                                    " chunks)",
-                                    i,
-                                    len(current_batch),
-                                    current_chunks,
-                                )
-
-                        # Process final batch if any items remain
-                        if current_batch:
-                            batch_count += 1
-                            log.info(
-                                "🏁 FINAL BATCH: batch %s with %s texts → %s chunks",
-                                batch_count,
-                                len(current_batch),
-                                current_chunks,
-                            )
-                            process_batch(current_batch)
-
-                        log.info(
-                            "Completed processing %s items in %s chunk-aware batches",
-                            len(pending_items),
+                            "Processed %s/%s items (%s batches so far)",
+                            i,
+                            len(all_items),
                             batch_count,
                         )
-                        pending_items.clear()
 
-                    if line_count % 1000 == 0:
-                        msg = "Read %s lines, %s processed with agencies" % (
-                            line_count,
-                            processed_count,
-                        )
-                        log.info(msg)
-
-                # Process remaining items in final batches
-                if pending_items:
-                    # Sort final batch by length
-                    pending_items.sort(key=lambda x: x["length"])
-                    log.debug("Processing final %s items", len(pending_items))
-
-                    # Use same chunk-aware batching for final items
-                    current_batch = []
-                    current_chunks = 0
-                    batch_count = 0
-
-                    for item in pending_items:
-                        item_chunks = estimate_chunks(item["text"])
-
-                        # If adding this item would exceed target chunks,
-                        # process current batch
-                        if (
-                            current_batch
-                            and current_chunks + item_chunks > target_chunks
-                        ):
-                            batch_count += 1
-                            log.debug(
-                                "Final chunk-aware batch %s: %s texts → %s chunks",
-                                batch_count,
-                                len(current_batch),
-                                current_chunks,
-                            )
-                            process_batch(current_batch)
-                            current_batch = [item]
-                            current_chunks = item_chunks
-                        else:
-                            current_batch.append(item)
-                            current_chunks += item_chunks
-
-                    # Process final batch if any items remain
-                    if current_batch:
+                    # If adding this item would exceed target chunks, process current batch
+                    if current_batch and current_chunks + item_chunks > target_chunks:
                         batch_count += 1
                         log.debug(
-                            "Final chunk-aware batch %s: %s texts → %s chunks",
+                            "Batch %s: %s texts → %s chunks (would be %s with next"
+                            " item)",
                             batch_count,
                             len(current_batch),
                             current_chunks,
+                            current_chunks + item_chunks,
                         )
                         process_batch(current_batch)
+                        current_batch = [item]
+                        current_chunks = item_chunks
+                    else:
+                        current_batch.append(item)
+                        current_chunks += item_chunks
 
+                # Process final batch if any items remain
+                if current_batch:
+                    batch_count += 1
                     log.info(
-                        "Completed processing final %s items in %s chunk-aware batches",
-                        len(pending_items),
+                        "🏁 FINAL BATCH: batch %s with %s texts → %s chunks",
                         batch_count,
+                        len(current_batch),
+                        current_chunks,
                     )
+                    process_batch(current_batch)
+
+                log.info(
+                    "Completed processing %s items in %s chunk-aware batches",
+                    len(all_items),
+                    batch_count,
+                )
 
         except Exception as e:
             log.error("Error processing file: %s", e, exc_info=True)
