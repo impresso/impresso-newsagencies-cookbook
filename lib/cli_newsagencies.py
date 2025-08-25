@@ -32,13 +32,6 @@ from impresso_cookbook import ( # type: ignore
     get_transport_params,
 )
 
-# Add datasets import for optimal pipeline usage
-try:
-    from datasets import Dataset # type: ignore
-    HAS_DATASETS = True
-except ImportError:
-    HAS_DATASETS = False
-
 log = logging.getLogger(__name__)
 
 
@@ -81,7 +74,7 @@ def parse_arguments(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,  # Changed back to 8 for test consistency
+        default=8,
         help="Batch size for processing texts (default: %(default)s)",
     )
     parser.add_argument(
@@ -102,7 +95,7 @@ class NewsAgencyProcessorV2:
         self,
         input_file: str,
         output_file: str,
-        batch_size: int = 8,  # Changed back to 8 for test consistency
+        batch_size: int = 8,
         min_relevance: float = 0.1,
         log_level: str = "INFO",
         log_file: Optional[str] = None,
@@ -183,32 +176,12 @@ class NewsAgencyProcessorV2:
             # Process batch through external pipeline
             batch_start_time = time.time()
             
-            try:
-                # Pass the list of texts directly to the pipeline
-                # This allows the pipeline to handle its own internal batching efficiently
-                log.debug("Passing %s texts to pipeline for internal batching", batch_len)
-                results = self.pipeline(batch_texts)
-                
-            except Exception as e:
-                log.warning("Direct pipeline call failed, trying with parameters: %s", e)
-                try:
-                    # Try with explicit parameters if direct call fails
-                    results = self.pipeline(
-                        input_texts=batch_texts,
-                        min_relevance=self.min_relevance,
-                    )
-                except Exception as e2:
-                    log.warning("Parameterized pipeline call failed, trying individual processing: %s", e2)
-                    # Fallback to individual text processing
-                    results = []
-                    for text in batch_texts:
-                        try:
-                            result = self.pipeline(text)
-                            results.append(result)
-                        except Exception as e3:
-                            log.error("Individual text processing failed: %s", e3)
-                            # Create empty result for failed text
-                            results.append({"agencies": []})
+            # Call the external pipeline with the batch of texts
+            results = self.pipeline(
+                input_texts=batch_texts,
+                min_relevance=self.min_relevance,
+                diagnostics=True,  # Get detailed results like the original script
+            )
             
             batch_end_time = time.time()
             batch_duration = batch_end_time - batch_start_time
@@ -219,72 +192,36 @@ class NewsAgencyProcessorV2:
                 batch_len / batch_duration if batch_duration > 0 else 0,
             )
 
-            # Handle the pipeline results
-            batch_results = results
-            
+            # Handle the pipeline results - it might return a tuple or just results
+            if isinstance(results, tuple):
+                batch_results = results[0]  # Get the actual results from tuple
+            else:
+                batch_results = results
+
             # Ensure we have a list of results matching our batch
             if not isinstance(batch_results, list):
                 batch_results = [batch_results]  # Single result to list
 
-            # Ensure we have the right number of results
-            if len(batch_results) != len(batch_data):
-                log.warning(
-                    "Results count mismatch: got %s results for %s texts", 
-                    len(batch_results), 
-                    len(batch_data)
-                )
-                # Pad with empty results if needed
-                while len(batch_results) < len(batch_data):
-                    batch_results.append({"agencies": []})
-
             # Write results for texts that have agencies
             for result, data in zip(batch_results, batch_data):
-                # Handle different result formats
-                if isinstance(result, dict):
-                    agencies = result.get("agencies", [])
-                elif hasattr(result, 'agencies'):
-                    agencies = result.agencies
-                else:
-                    log.warning("Unexpected result format: %s", type(result))
-                    agencies = []
-
-                agencies_found = len(agencies)
+                agencies_found = len(result.get("agencies", []))
                 log.debug(
                     "Found %s agencies for %s", agencies_found, data["content_id"]
                 )
 
-                if agencies:
-                    # Filter agencies by min_relevance if not already done by pipeline
-                    filtered_agencies = []
-                    for agency in agencies:
-                        if isinstance(agency, dict):
-                            relevance = agency.get("relevance", agency.get("score", 1.0))
-                            entity_type = agency.get("uid", agency.get("entity", "unknown"))
-                        else:
-                            relevance = getattr(agency, 'relevance', getattr(agency, 'score', 1.0))
-                            entity_type = getattr(agency, 'uid', getattr(agency, 'entity', 'unknown'))
-                        
-                        if relevance >= self.min_relevance:
-                            filtered_agencies.append(agency)
-                            entity_type_counts[entity_type] = (
-                                entity_type_counts.get(entity_type, 0) + 1
-                            )
+                if result.get("agencies"):
+                    # Count entity types for statistics
+                    for agency in result.get("agencies", []):
+                        entity_type = agency.get("uid", agency.get("entity", "unknown"))
+                        entity_type_counts[entity_type] = (
+                            entity_type_counts.get(entity_type, 0) + 1
+                        )
 
-                    if filtered_agencies:
-                        # Ensure result is in the expected format
-                        if not isinstance(result, dict):
-                            result = {"agencies": filtered_agencies}
-                        else:
-                            result["agencies"] = filtered_agencies
-                        
-                        result["ts"] = self.timestamp
-                        result["id"] = data["content_id"]
-                        log.debug("Writing result for content %s", data["content_id"])
-                        output_stream.write(json.dumps(result, ensure_ascii=False) + "\n")
-                        processed_count += 1
-                    else:
-                        log.debug("No agencies above relevance threshold for %s, skipping", data["content_id"])
-                        skipped_count += 1
+                    result["ts"] = self.timestamp
+                    result["id"] = data["content_id"]
+                    log.debug("Writing result for content %s", data["content_id"])
+                    output_stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    processed_count += 1
                 else:
                     log.debug("No agencies found for %s, skipping", data["content_id"])
                     skipped_count += 1
@@ -358,29 +295,38 @@ class NewsAgencyProcessorV2:
             ) as output_stream:
                 current_batch = []
                 batch_count = 0
-                
-                # Process in larger chunks for better GPU utilization
-                for i in range(0, len(all_items), self.batch_size):
-                    batch_items = all_items[i:i + self.batch_size]
-                    batch_count += 1
-                    
-                    log.debug(
-                        "Batch %s: processing %s texts (items %s-%s)",
-                        batch_count,
-                        len(batch_items),
-                        i,
-                        min(i + self.batch_size, len(all_items))
-                    )
-                    
-                    process_batch(batch_items)
-                    
-                    if i % (self.batch_size * 10) == 0 and i > 0:
-                        log.info(
-                            "Progress: %s/%s items processed (%s batches completed)",
+
+                for i, item in enumerate(all_items):
+                    current_batch.append(item)
+
+                    if i % 1000 == 0 and i > 0:
+                        log.debug(
+                            "Processed %s/%s items (%s batches so far)",
                             i,
                             len(all_items),
-                            batch_count - 1,
+                            batch_count,
                         )
+
+                    # Process when batch is full
+                    if len(current_batch) >= self.batch_size:
+                        batch_count += 1
+                        log.debug(
+                            "Batch %s: %s texts",
+                            batch_count,
+                            len(current_batch),
+                        )
+                        process_batch(current_batch)
+                        current_batch = []
+
+                # Process final batch if any items remain
+                if current_batch:
+                    batch_count += 1
+                    log.info(
+                        "🏁 FINAL BATCH: batch %s with %s texts",
+                        batch_count,
+                        len(current_batch),
+                    )
+                    process_batch(current_batch)
 
                 log.info(
                     "Completed processing %s items in %s batches",
