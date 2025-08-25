@@ -25,13 +25,6 @@ import time
 from smart_open import open as smart_open  # type: ignore
 from typing import List, Optional, Dict, Any
 
-# NEW: optionally use Hugging Face Datasets for efficient streaming + batching
-try:
-    from datasets import load_dataset  # type: ignore
-    HAS_DATASETS = True
-except Exception:
-    HAS_DATASETS = False
-
 from impresso_pipelines.newsagencies import NewsAgenciesPipeline # type: ignore
 from impresso_cookbook import ( # type: ignore
     get_timestamp,
@@ -90,13 +83,6 @@ def parse_arguments(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=0.1,
         help="Minimum relevance threshold for entities (default: %(default)s)",
     )
-    # NEW: engine selector
-    parser.add_argument(
-        "--engine",
-        choices=["datasets", "legacy"],
-        default="datasets",
-        help="Processing engine: 'datasets' (streaming, recommended) or 'legacy' (in-memory). Default: %(default)s",
-    )
     return parser.parse_args(args)
 
 
@@ -113,7 +99,6 @@ class NewsAgencyProcessorV2:
         min_relevance: float = 0.1,
         log_level: str = "INFO",
         log_file: Optional[str] = None,
-        engine: str = "datasets",  # NEW
     ) -> None:
         """
         Initializes the NewsAgencyProcessorV2 with explicit parameters.
@@ -132,7 +117,6 @@ class NewsAgencyProcessorV2:
         self.min_relevance = min_relevance
         self.log_level = log_level
         self.log_file = log_file
-        self.engine = engine  # NEW
 
         # Configure the module-specific logger
         setup_logging(self.log_level, self.log_file, logger=log)
@@ -142,7 +126,6 @@ class NewsAgencyProcessorV2:
         log.debug("Log file: %s", log_file)
         log.debug("Batch size: %s", batch_size)
         log.debug("Min relevance: %s", min_relevance)
-        log.debug("Engine: %s (datasets available: %s)", self.engine, HAS_DATASETS)  # NEW
 
         # Initialize timestamp
         self.timestamp = get_timestamp()
@@ -152,148 +135,9 @@ class NewsAgencyProcessorV2:
         self.pipeline = NewsAgenciesPipeline()
         log.info("NewsAgencyProcessorV2 ready")
 
-    def _run_with_datasets(self) -> None:
+    def run(self) -> None:
         """
-        Streaming processing using Hugging Face Datasets to keep GPU busy and reduce memory use.
-        """
-        if not HAS_DATASETS:
-            log.warning("Datasets is not available. Falling back to legacy engine.")
-            return self._run_legacy()
-
-        start_time = time.time()
-        log.info("Starting streaming processing (datasets): %s -> %s", self.input_file, self.output_file)
-        log.info("Using batch_size=%s", self.batch_size)
-
-        line_count = 0
-        processed_count = 0
-        skipped_count = 0
-        entity_type_counts: Dict[str, int] = {}
-
-        # Build a streaming dataset over the JSONL file
-        try:
-            # Streaming avoids reading all into memory and works with local paths or URLs/S3 (if supported)
-            ds = load_dataset(
-                "json",
-                data_files=self.input_file,
-                split="train",
-                streaming=True,
-            )
-        except Exception as e:
-            log.error("Failed to initialize datasets streaming: %s", e, exc_info=True)
-            sys.exit(1)
-
-        def iter_items():
-            nonlocal line_count, skipped_count
-            for row in ds:
-                line_count += 1
-                text = row.get("ft", "") or ""
-                content_id = row.get("id", row.get("c_id", ""))
-                if len(text.strip()) == 0:
-                    skipped_count += 1
-                    continue
-                yield {
-                    "text": text,
-                    "content_id": content_id,
-                    "length": len(text),
-                }
-
-        def process_batch(batch_items, output_stream):
-            nonlocal processed_count, skipped_count, entity_type_counts
-            if not batch_items:
-                return
-
-            batch_texts = [it["text"] for it in batch_items]
-            batch_ids = [it["content_id"] for it in batch_items]
-
-            text_lengths = [len(t) for t in batch_texts]
-            log.info(
-                "🔄 Processing batch of %s texts (total: %s chars, max: %s chars)",
-                len(batch_texts),
-                sum(text_lengths),
-                max(text_lengths) if text_lengths else 0,
-            )
-
-            batch_start_time = time.time()
-            results = self.pipeline(
-                input_texts=batch_texts,
-                min_relevance=self.min_relevance,
-                diagnostics=True,
-            )
-            batch_duration = time.time() - batch_start_time
-            log.info(
-                "⏱️  Batch completed in %.2fs (%.1f texts/sec)",
-                batch_duration,
-                len(batch_texts) / batch_duration if batch_duration > 0 else 0,
-            )
-
-            if isinstance(results, tuple):
-                batch_results = results[0]
-            else:
-                batch_results = results
-            if not isinstance(batch_results, list):
-                batch_results = [batch_results]
-
-            for result, cid in zip(batch_results, batch_ids):
-                agencies = result.get("agencies", [])
-                if agencies:
-                    for agency in agencies:
-                        entity_type = agency.get("uid", agency.get("entity", "unknown"))
-                        entity_type_counts[entity_type] = entity_type_counts.get(entity_type, 0) + 1
-                    result["ts"] = self.timestamp
-                    result["id"] = cid
-                    output_stream.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    processed_count += 1
-                else:
-                    skipped_count += 1
-
-        # Iterate, batch, and write results
-        current_batch: List[Dict[str, Any]] = []
-        batch_count = 0
-
-        try:
-            with smart_open(
-                self.output_file,
-                "w",
-                encoding="utf-8",
-                transport_params=get_transport_params(self.output_file),
-            ) as output_stream:
-                for item in iter_items():
-                    current_batch.append(item)
-                    if len(current_batch) >= self.batch_size:
-                        batch_count += 1
-                        process_batch(current_batch, output_stream)
-                        current_batch = []
-                if current_batch:
-                    batch_count += 1
-                    log.info("🏁 FINAL BATCH: batch %s with %s texts", batch_count, len(current_batch))
-                    process_batch(current_batch, output_stream)
-        except Exception as e:
-            log.error("Error during datasets streaming run: %s", e, exc_info=True)
-            sys.exit(1)
-
-        # Final stats and logs
-        total_duration = time.time() - start_time
-        items_per_second = (line_count / total_duration) if total_duration > 0 else 0.0
-        log.info("Processing complete: %s lines total, %s processed, %s skipped", line_count, processed_count, skipped_count)
-
-        if entity_type_counts:
-            log.info("📈 ENTITY TYPE SUMMARY:")
-            total_entities = sum(entity_type_counts.values())
-            log.info("   Total entities found: %s", total_entities)
-            for entity_type, count in sorted(entity_type_counts.items(), key=lambda x: x[1], reverse=True):
-                pct = (count / total_entities) * 100 if total_entities > 0 else 0
-                log.info("   %s: %s entities (%.1f%%)", entity_type, count, pct)
-        else:
-            log.info("📈 ENTITY TYPE SUMMARY: No entities found")
-
-        log.info("📊 PERFORMANCE SUMMARY:")
-        log.info("   Total processing time: %.2f seconds", total_duration)
-        log.info("   Total lines read: %s", line_count)
-        log.info("   Overall throughput: %.1f items/second", items_per_second)
-
-    def _run_legacy(self) -> None:
-        """
-        Previous in-memory batching implementation (unchanged).
+        Runs the processor with batch processing for optimal utilization.
         """
         start_time = time.time()
         log.info(
@@ -529,17 +373,6 @@ class NewsAgencyProcessorV2:
         log.info("   Total items processed: %s", len(all_items))
         log.info("   Overall throughput: %.1f items/second", items_per_second)
 
-    def run(self) -> None:
-        """
-        Dispatch to the selected engine.
-        """
-        if self.engine == "datasets":
-            if not HAS_DATASETS:
-                log.warning("Engine 'datasets' selected but datasets is not installed. Falling back to 'legacy'.")
-                return self._run_legacy()
-            return self._run_with_datasets()
-        return self._run_legacy()
-
 
 def main(args: Optional[List[str]] = None) -> None:
     """
@@ -557,7 +390,6 @@ def main(args: Optional[List[str]] = None) -> None:
         min_relevance=options.min_relevance,
         log_level=options.log_level,
         log_file=options.log_file,
-        engine=options.engine,  # NEW
     )
 
     # Log the parsed options after logger is configured
