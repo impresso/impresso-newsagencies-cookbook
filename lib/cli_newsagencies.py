@@ -32,6 +32,13 @@ from impresso_cookbook import ( # type: ignore
     get_transport_params,
 )
 
+# Add datasets import for optimal pipeline usage
+try:
+    from datasets import Dataset # type: ignore
+    HAS_DATASETS = True
+except ImportError:
+    HAS_DATASETS = False
+
 log = logging.getLogger(__name__)
 
 
@@ -177,25 +184,26 @@ class NewsAgencyProcessorV2:
             batch_start_time = time.time()
             
             try:
-                # Try the standard pipeline call first
-                results = self.pipeline(
-                    input_texts=batch_texts,
-                    min_relevance=self.min_relevance,
-                    diagnostics=True,
-                )
+                # Pass the list of texts directly to the pipeline
+                # This allows the pipeline to handle its own internal batching efficiently
+                log.debug("Passing %s texts to pipeline for internal batching", batch_len)
+                results = self.pipeline(batch_texts)
                 
             except Exception as e:
-                log.warning("Standard pipeline call failed, trying direct call: %s", e)
+                log.warning("Direct pipeline call failed, trying with parameters: %s", e)
                 try:
-                    # Try direct call without named parameters
-                    results = self.pipeline(batch_texts)
+                    # Try with explicit parameters if direct call fails
+                    results = self.pipeline(
+                        input_texts=batch_texts,
+                        min_relevance=self.min_relevance,
+                    )
                 except Exception as e2:
-                    log.warning("Direct pipeline call failed, trying alternative: %s", e2)
-                    # Try calling with individual texts
+                    log.warning("Parameterized pipeline call failed, trying individual processing: %s", e2)
+                    # Fallback to individual text processing
                     results = []
                     for text in batch_texts:
                         try:
-                            result = self.pipeline(text, min_relevance=self.min_relevance)
+                            result = self.pipeline(text)
                             results.append(result)
                         except Exception as e3:
                             log.error("Individual text processing failed: %s", e3)
@@ -211,15 +219,9 @@ class NewsAgencyProcessorV2:
                 batch_len / batch_duration if batch_duration > 0 else 0,
             )
 
-            # Handle the pipeline results - it might return a tuple, ModelOutput, or just results
-            if isinstance(results, tuple):
-                batch_results = results[0]  # Get the actual results from tuple
-            elif hasattr(results, 'prediction') or hasattr(results, 'predictions'):
-                # Handle ModelOutput or similar objects
-                batch_results = getattr(results, 'predictions', getattr(results, 'prediction', results))
-            else:
-                batch_results = results
-
+            # Handle the pipeline results
+            batch_results = results
+            
             # Ensure we have a list of results matching our batch
             if not isinstance(batch_results, list):
                 batch_results = [batch_results]  # Single result to list
@@ -252,25 +254,37 @@ class NewsAgencyProcessorV2:
                 )
 
                 if agencies:
-                    # Count entity types for statistics
+                    # Filter agencies by min_relevance if not already done by pipeline
+                    filtered_agencies = []
                     for agency in agencies:
                         if isinstance(agency, dict):
+                            relevance = agency.get("relevance", agency.get("score", 1.0))
                             entity_type = agency.get("uid", agency.get("entity", "unknown"))
                         else:
+                            relevance = getattr(agency, 'relevance', getattr(agency, 'score', 1.0))
                             entity_type = getattr(agency, 'uid', getattr(agency, 'entity', 'unknown'))
-                        entity_type_counts[entity_type] = (
-                            entity_type_counts.get(entity_type, 0) + 1
-                        )
+                        
+                        if relevance >= self.min_relevance:
+                            filtered_agencies.append(agency)
+                            entity_type_counts[entity_type] = (
+                                entity_type_counts.get(entity_type, 0) + 1
+                            )
 
-                    # Ensure result is in the expected format
-                    if not isinstance(result, dict):
-                        result = {"agencies": agencies}
-                    
-                    result["ts"] = self.timestamp
-                    result["id"] = data["content_id"]
-                    log.debug("Writing result for content %s", data["content_id"])
-                    output_stream.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    processed_count += 1
+                    if filtered_agencies:
+                        # Ensure result is in the expected format
+                        if not isinstance(result, dict):
+                            result = {"agencies": filtered_agencies}
+                        else:
+                            result["agencies"] = filtered_agencies
+                        
+                        result["ts"] = self.timestamp
+                        result["id"] = data["content_id"]
+                        log.debug("Writing result for content %s", data["content_id"])
+                        output_stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        processed_count += 1
+                    else:
+                        log.debug("No agencies above relevance threshold for %s, skipping", data["content_id"])
+                        skipped_count += 1
                 else:
                     log.debug("No agencies found for %s, skipping", data["content_id"])
                     skipped_count += 1
