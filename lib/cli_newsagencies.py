@@ -74,7 +74,7 @@ def parse_arguments(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
+        default=8,  # Changed back to 8 for test consistency
         help="Batch size for processing texts (default: %(default)s)",
     )
     parser.add_argument(
@@ -95,7 +95,7 @@ class NewsAgencyProcessorV2:
         self,
         input_file: str,
         output_file: str,
-        batch_size: int = 8,
+        batch_size: int = 8,  # Changed back to 8 for test consistency
         min_relevance: float = 0.1,
         log_level: str = "INFO",
         log_file: Optional[str] = None,
@@ -176,12 +176,28 @@ class NewsAgencyProcessorV2:
             # Process batch through external pipeline
             batch_start_time = time.time()
             
-            # Call the external pipeline with the batch of texts
-            results = self.pipeline(
-                input_texts=batch_texts,
-                min_relevance=self.min_relevance,
-                diagnostics=True,  # Get detailed results like the original script
-            )
+            try:
+                # Call the external pipeline with the entire batch at once
+                # This should help with GPU utilization by processing all texts together
+                results = self.pipeline(
+                    batch_texts,  # Pass as a list directly for batch processing
+                    min_relevance=self.min_relevance,
+                    batch_size=len(batch_texts),  # Explicitly set batch size
+                )
+                
+                # Alternative approach if the above doesn't work:
+                # Create a dataset-like structure that the pipeline can process efficiently
+                # dataset = [{"text": text} for text in batch_texts]
+                # results = self.pipeline(dataset, min_relevance=self.min_relevance)
+                
+            except Exception as e:
+                log.warning("Pipeline call failed, trying alternative approach: %s", e)
+                # Fallback to the original approach if batch processing fails
+                results = self.pipeline(
+                    input_texts=batch_texts,
+                    min_relevance=self.min_relevance,
+                    diagnostics=True,
+                )
             
             batch_end_time = time.time()
             batch_duration = batch_end_time - batch_start_time
@@ -295,38 +311,29 @@ class NewsAgencyProcessorV2:
             ) as output_stream:
                 current_batch = []
                 batch_count = 0
-
-                for i, item in enumerate(all_items):
-                    current_batch.append(item)
-
-                    if i % 1000 == 0 and i > 0:
-                        log.debug(
-                            "Processed %s/%s items (%s batches so far)",
+                
+                # Process in larger chunks for better GPU utilization
+                for i in range(0, len(all_items), self.batch_size):
+                    batch_items = all_items[i:i + self.batch_size]
+                    batch_count += 1
+                    
+                    log.debug(
+                        "Batch %s: processing %s texts (items %s-%s)",
+                        batch_count,
+                        len(batch_items),
+                        i,
+                        min(i + self.batch_size, len(all_items))
+                    )
+                    
+                    process_batch(batch_items)
+                    
+                    if i % (self.batch_size * 10) == 0 and i > 0:
+                        log.info(
+                            "Progress: %s/%s items processed (%s batches completed)",
                             i,
                             len(all_items),
-                            batch_count,
+                            batch_count - 1,
                         )
-
-                    # Process when batch is full
-                    if len(current_batch) >= self.batch_size:
-                        batch_count += 1
-                        log.debug(
-                            "Batch %s: %s texts",
-                            batch_count,
-                            len(current_batch),
-                        )
-                        process_batch(current_batch)
-                        current_batch = []
-
-                # Process final batch if any items remain
-                if current_batch:
-                    batch_count += 1
-                    log.info(
-                        "🏁 FINAL BATCH: batch %s with %s texts",
-                        batch_count,
-                        len(current_batch),
-                    )
-                    process_batch(current_batch)
 
                 log.info(
                     "Completed processing %s items in %s batches",
