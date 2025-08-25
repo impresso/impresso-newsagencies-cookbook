@@ -177,27 +177,30 @@ class NewsAgencyProcessorV2:
             batch_start_time = time.time()
             
             try:
-                # Call the external pipeline with the entire batch at once
-                # This should help with GPU utilization by processing all texts together
-                results = self.pipeline(
-                    batch_texts,  # Pass as a list directly for batch processing
-                    min_relevance=self.min_relevance,
-                    batch_size=len(batch_texts),  # Explicitly set batch size
-                )
-                
-                # Alternative approach if the above doesn't work:
-                # Create a dataset-like structure that the pipeline can process efficiently
-                # dataset = [{"text": text} for text in batch_texts]
-                # results = self.pipeline(dataset, min_relevance=self.min_relevance)
-                
-            except Exception as e:
-                log.warning("Pipeline call failed, trying alternative approach: %s", e)
-                # Fallback to the original approach if batch processing fails
+                # Try the standard pipeline call first
                 results = self.pipeline(
                     input_texts=batch_texts,
                     min_relevance=self.min_relevance,
                     diagnostics=True,
                 )
+                
+            except Exception as e:
+                log.warning("Standard pipeline call failed, trying direct call: %s", e)
+                try:
+                    # Try direct call without named parameters
+                    results = self.pipeline(batch_texts)
+                except Exception as e2:
+                    log.warning("Direct pipeline call failed, trying alternative: %s", e2)
+                    # Try calling with individual texts
+                    results = []
+                    for text in batch_texts:
+                        try:
+                            result = self.pipeline(text, min_relevance=self.min_relevance)
+                            results.append(result)
+                        except Exception as e3:
+                            log.error("Individual text processing failed: %s", e3)
+                            # Create empty result for failed text
+                            results.append({"agencies": []})
             
             batch_end_time = time.time()
             batch_duration = batch_end_time - batch_start_time
@@ -208,9 +211,12 @@ class NewsAgencyProcessorV2:
                 batch_len / batch_duration if batch_duration > 0 else 0,
             )
 
-            # Handle the pipeline results - it might return a tuple or just results
+            # Handle the pipeline results - it might return a tuple, ModelOutput, or just results
             if isinstance(results, tuple):
                 batch_results = results[0]  # Get the actual results from tuple
+            elif hasattr(results, 'prediction') or hasattr(results, 'predictions'):
+                # Handle ModelOutput or similar objects
+                batch_results = getattr(results, 'predictions', getattr(results, 'prediction', results))
             else:
                 batch_results = results
 
@@ -218,21 +224,48 @@ class NewsAgencyProcessorV2:
             if not isinstance(batch_results, list):
                 batch_results = [batch_results]  # Single result to list
 
+            # Ensure we have the right number of results
+            if len(batch_results) != len(batch_data):
+                log.warning(
+                    "Results count mismatch: got %s results for %s texts", 
+                    len(batch_results), 
+                    len(batch_data)
+                )
+                # Pad with empty results if needed
+                while len(batch_results) < len(batch_data):
+                    batch_results.append({"agencies": []})
+
             # Write results for texts that have agencies
             for result, data in zip(batch_results, batch_data):
-                agencies_found = len(result.get("agencies", []))
+                # Handle different result formats
+                if isinstance(result, dict):
+                    agencies = result.get("agencies", [])
+                elif hasattr(result, 'agencies'):
+                    agencies = result.agencies
+                else:
+                    log.warning("Unexpected result format: %s", type(result))
+                    agencies = []
+
+                agencies_found = len(agencies)
                 log.debug(
                     "Found %s agencies for %s", agencies_found, data["content_id"]
                 )
 
-                if result.get("agencies"):
+                if agencies:
                     # Count entity types for statistics
-                    for agency in result.get("agencies", []):
-                        entity_type = agency.get("uid", agency.get("entity", "unknown"))
+                    for agency in agencies:
+                        if isinstance(agency, dict):
+                            entity_type = agency.get("uid", agency.get("entity", "unknown"))
+                        else:
+                            entity_type = getattr(agency, 'uid', getattr(agency, 'entity', 'unknown'))
                         entity_type_counts[entity_type] = (
                             entity_type_counts.get(entity_type, 0) + 1
                         )
 
+                    # Ensure result is in the expected format
+                    if not isinstance(result, dict):
+                        result = {"agencies": agencies}
+                    
                     result["ts"] = self.timestamp
                     result["id"] = data["content_id"]
                     log.debug("Writing result for content %s", data["content_id"])
