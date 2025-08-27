@@ -216,7 +216,8 @@ class NewsAgencyProcessorV2:
                         entity_type_counts[entity_type] = (
                             entity_type_counts.get(entity_type, 0) + 1
                         )
-
+		    
+		    result.pop("text", None)
                     result["ts"] = self.timestamp
                     result["id"] = data["content_id"]
                     log.debug("Writing result for content %s", data["content_id"])
