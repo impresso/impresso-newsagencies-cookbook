@@ -2,3 +2,5 @@
 # store as `.env` file
 SE_ACCESS_KEY=<YOUR VALUE>
 SE_SECRET_KEY=<YOUR VALUE>
+SE_HOST_URL=https://os.zhdk.cloud.switch.ch
+PIPENV_VENV_IN_PROJECT=enabled
