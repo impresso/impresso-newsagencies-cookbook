@@ -1,38 +1,600 @@
 #!/usr/bin/env python3
 """
-News Agencies NER CLI Script using impresso_pipelines.newsagencies
+News Agencies NER CLI Script
 
 This module implements a CLI script for extracting news agencies from text using
-the NewsAgenciesPipeline from impresso_pipelines.newsagencies package.
+Named Entity Recognition (NER). It includes:
 
-Key features:
-1. **External Pipeline Integration**: Uses NewsAgenciesPipeline from impresso_pipelines
-2. **Batch Processing**: Optimized batching for efficient processing of large datasets
-3. **File I/O Operations**: Uses smart_open for seamless handling of local files and S3 URIs
-4. **Logging Configuration**: Consistent logging across all project tools
-5. **Error Handling**: Robust error handling with proper logging
+1. **Batch GPU Processing**: Optimized NewsAgenciesPipeline with chunk-aware token
+   classification for efficient processing of large texts and batches.
+
+2. **Custom Model Architecture**: NewsAgencyTokenClassifier with proper token
+   classification head and support for overlapping chunks.
+
+3. **File I/O Operations**: Uses smart_open for seamless handling of both local files
+   and S3 URIs, with automatic transport parameter configuration.
+
+4. **Logging Configuration**: Integrates with impresso_cookbook's setup_logging
+   function for consistent logging across all project tools.
+
+5. **Error Handling**: Implements robust error handling with proper logging of
+   failures during file processing operations.
 
 Example:
-    $ python cli_newsagencies_v_pipeline.py -i input.jsonl -o output.jsonl --log-level INFO
-    $ python cli_newsagencies_v_pipeline.py -i s3://bucket/input.jsonl -o s3://bucket/output.jsonl
+    $ python cli_newsagencies.py -i input.jsonl -o output.jsonl --log-level INFO
+    $ python cli_newsagencies.py -i s3://bucket/input.jsonl -o s3://bucket/output.jsonl
 """
 
 import logging
 import argparse
 import json
 import sys
-import time
 from smart_open import open as smart_open  # type: ignore
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Sequence, Tuple, Union, Set
 
-from impresso_pipelines.newsagencies import NewsAgenciesPipeline # type: ignore
-from impresso_cookbook import ( # type: ignore
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import (
+    AutoTokenizer,
+    AutoConfig,
+    AutoModel,
+    Pipeline,
+    PreTrainedModel,
+)
+from transformers.modeling_outputs import TokenClassifierOutput
+
+from impresso_cookbook import (  # type: ignore
     get_timestamp,
     setup_logging,
     get_transport_params,
 )
 
+from impresso_pipelines.newsagencies.config import AGENCY_LINKS
+
 log = logging.getLogger(__name__)
+
+
+class NewsAgencyTokenClassifier(PreTrainedModel):
+    """
+    Custom token classification model for news agencies.
+    """
+
+    config_class = AutoConfig
+    _keys_to_ignore_on_load_missing = [r"position_ids"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        # Backbone encoder
+        self.bert = AutoModel.from_config(config)
+        # Dropout
+        dropout_prob = (
+            getattr(config, "classifier_dropout", None)
+            or getattr(config, "hidden_dropout_prob", 0.0)
+            or 0.0
+        )
+        self.dropout = nn.Dropout(dropout_prob)
+        # Token classification head
+        self.token_classifier = nn.Linear(config.hidden_size, len(config.id2label))
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: bool = True,
+    ) -> TokenClassifierOutput:
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        sequence_output = self.dropout(outputs[0])
+        logits = self.token_classifier(sequence_output)
+        if not return_dict:
+            return (logits,) + outputs[2:]
+        return TokenClassifierOutput(
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class ChunkAwareTokenClassification(Pipeline):
+    """
+    Chunk-aware token classification supporting batch input and proper reassembly.
+    """
+
+    def __init__(
+        self,
+        model: NewsAgencyTokenClassifier,
+        tokenizer: AutoTokenizer,
+        min_score: float = 0.50,
+        device: Optional[Union[int, str]] = 0,
+    ):
+        super().__init__(model=model, tokenizer=tokenizer, device=device)
+        self.min_score = min_score
+
+    def _sanitize_parameters(self, **kwargs):
+        return {}, {}, {}
+
+    def preprocess(self, inputs):
+        return inputs
+
+    def _forward(self, model_inputs):
+        return model_inputs
+
+    def postprocess(self, model_outputs):
+        return model_outputs
+
+    def __call__(
+        self,
+        texts: Union[str, List[str]],
+        text_ids: Optional[List[str]] = None,
+    ) -> Tuple[List[List[Dict[str, Any]]], int]:
+        # Always normalize to list - treat single string as batch of 1
+        if isinstance(texts, str):
+            texts = [texts]
+
+        if text_ids is None:
+            text_ids = [f"text_{i}" for i in range(len(texts))]
+        elif isinstance(text_ids, str):
+            text_ids = [text_ids]
+
+        # Filter out empty texts completely - don't process or return them
+        non_empty_texts = []
+        non_empty_text_ids = []
+
+        for i, (text, text_id) in enumerate(zip(texts, text_ids)):
+            if len(text.strip()) == 0:
+                log.debug("Skipping empty text at position %s (text_id=%s)", i, text_id)
+            else:
+                non_empty_texts.append(text)
+                non_empty_text_ids.append(text_id)
+
+        # If all texts are empty, return empty results
+        if not non_empty_texts:
+            log.info("All texts are empty, returning empty results")
+            return [], 0
+
+        log.debug("ChunkAware processing %s non-empty text(s)", len(non_empty_texts))
+        log.debug("Text character counts: %s", [len(text) for text in non_empty_texts])
+
+        # Batch tokenize with overflow handling - only process non-empty texts
+        log.debug(
+            "Starting tokenization for %s non-empty text(s)...", len(non_empty_texts)
+        )
+        encodings = self.tokenizer(
+            non_empty_texts,
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            stride=64,
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,
+            return_attention_mask=True,
+        )
+        sample_mapping = encodings.pop("overflow_to_sample_mapping")
+        actual_chunks = len(sample_mapping)
+        log.info(
+            "🔄 Tokenized %s text(s) into %s actual chunks",
+            len(non_empty_texts),
+            actual_chunks,
+        )
+        log.debug("Input shape: %s", encodings["input_ids"].shape)
+
+        # Move to device
+        for k, v in encodings.items():
+            encodings[k] = v.to(self.model.device)
+
+        # Forward pass
+        log.debug("Starting model inference on %s chunks...", len(sample_mapping))
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=encodings["input_ids"],
+                attention_mask=encodings["attention_mask"],
+            )
+        logits = outputs.logits  # [num_chunks, seq_len, num_labels]
+        log.debug("Model inference complete. Processing entities...")
+
+        # Debug: Log raw model output statistics
+        log.debug("Raw logits shape: %s", logits.shape)
+        log.debug("Available labels: %s", list(self.model.config.id2label.values()))
+
+        # Sample a few predictions to see what the model is producing
+        sample_chunk_idx = 0 if logits.size(0) > 0 else None
+        if sample_chunk_idx is not None:
+            sample_logits = logits[sample_chunk_idx]  # [seq_len, num_labels]
+            sample_probs = F.softmax(sample_logits, dim=-1)
+            sample_predictions = torch.argmax(sample_probs, dim=-1)
+
+            log.debug("=== SAMPLE RAW MODEL OUTPUT ===")
+            log.debug("Chunk %s predictions (first 10 tokens):", sample_chunk_idx)
+            for i in range(min(10, sample_logits.size(0))):
+                pred_idx = int(sample_predictions[i])
+                pred_label = self.model.config.id2label[pred_idx]
+                pred_conf = float(sample_probs[i, pred_idx])
+                log.debug("  Token %s: %s (%.4f)", i, pred_label, pred_conf)
+            log.debug("=== END SAMPLE OUTPUT ===")
+
+        # Bring tensor inputs back to CPU for postprocess
+        offset_mapping = encodings["offset_mapping"].cpu()
+        input_ids = encodings["input_ids"].cpu()
+        attention_mask = encodings["attention_mask"].cpu()
+
+        # Prepare result containers - only for non-empty texts
+        results: List[List[Dict[str, Any]]] = [[] for _ in non_empty_texts]
+        seen: List[Set[Tuple[int, int, str]]] = [set() for _ in non_empty_texts]
+
+        log.debug("Starting token-level processing...")
+        num_chunks = logits.size(0)
+        for chunk_idx in range(num_chunks):
+            sample_idx = sample_mapping[chunk_idx]
+            seq_logits = logits[chunk_idx]  # [seq_len, num_labels]
+            offsets = offset_mapping[chunk_idx]
+            mask = attention_mask[chunk_idx]
+            tokens = self.tokenizer.convert_ids_to_tokens(input_ids[chunk_idx])
+
+            chunk_info = "chunk %s/%s for sample %s"
+            log.debug(
+                "Processing " + chunk_info,
+                chunk_idx + 1,
+                num_chunks,
+                sample_idx,
+            )
+            log.debug("Active tokens in chunk: %s", mask.sum().item())
+
+            current_word: List[str] = []
+            current_logits = None
+            current_offsets: List[Tuple[int, int]] = []
+
+            for tok, m, offs, logit in zip(tokens, mask, offsets, seq_logits):
+                if m.item() == 0 or tok in {"[CLS]", "[SEP]", "[PAD]"}:
+                    continue
+
+                # Debug: Log subtoken-level output similar to newsagencies_pipeline.py
+                if log.isEnabledFor(logging.DEBUG):
+                    probs = F.softmax(logit, dim=-1)
+                    sorted_idx = torch.argsort(probs, descending=True)
+                    prob_str = ", ".join(
+                        f"'{self.model.config.id2label[int(i)]}':{probs[i]:.3f}"
+                        for i in sorted_idx
+                        if probs[i] > 0.001
+                    )
+                    start, stop = offs.tolist()
+                    log.debug(f"Sub-token '{tok}' @({start},{stop}) → {prob_str}")
+
+                start, end = offs.tolist()
+                if not tok.startswith("##"):
+                    # finalize previous token
+                    if current_word and current_logits is not None:
+                        self._finalise_word(
+                            sample_idx,
+                            current_word,
+                            current_logits,
+                            current_offsets,
+                            seen,
+                            results,
+                        )
+                    # start new
+                    current_word = [tok]
+                    current_logits = logit
+                    current_offsets = [(start, end)]
+                else:
+                    current_word.append(tok)
+                    current_offsets.append((start, end))
+            # finalize last token in chunk
+            if current_word and current_logits is not None:
+                self._finalise_word(
+                    sample_idx,
+                    current_word,
+                    current_logits,
+                    current_offsets,
+                    seen,
+                    results,
+                )
+
+        log.debug("Token-level processing complete")
+        entity_counts = [len(result) for result in results]
+
+        # Log completion with text details and entity counts
+        if len(non_empty_texts) == 1:
+            text_len = len(non_empty_texts[0])
+            total_entities = sum(entity_counts)
+            log.info(
+                "Completed processing text_id=%s (length=%s chars): found %s entities",
+                non_empty_text_ids[0],
+                text_len,
+                total_entities,
+            )
+        else:
+            total_entities = sum(entity_counts)
+            log.info(
+                "Completed processing %s texts: found %s total entities",
+                len(non_empty_texts),
+                total_entities,
+            )
+
+        log.debug("Found entities per text: %s", entity_counts)
+
+        # Clean up GPU memory
+        del encodings, outputs, logits
+        torch.cuda.empty_cache()
+
+        return results, actual_chunks
+
+    def _finalise_word(
+        self,
+        sample_idx: int,
+        tokens: List[str],
+        first_logits: torch.Tensor,
+        offsets: List[Tuple[int, int]],
+        seen: List[Set[Tuple[int, int, str]]],
+        results: List[List[Dict[str, Any]]],
+    ) -> None:
+        # Confidence & label
+        probs = F.softmax(first_logits, dim=-1)
+        conf, idx = torch.max(probs, dim=-1)
+        label = self.model.config.id2label[int(idx)]
+
+        # Reconstruct word and span
+        word = self.tokenizer.convert_tokens_to_string(tokens)
+        start = offsets[0][0]
+        end = offsets[-1][1]
+
+        if label == "O" or conf < self.min_score:
+            return
+
+        key = (start, end, label)
+        if key in seen[sample_idx]:
+            return
+        seen[sample_idx].add(key)
+
+        entity_info = {
+            "word": word,
+            "entity": label,
+            "score": float(conf),
+            "start": int(start),
+            "stop": int(end),
+        }
+        results[sample_idx].append(entity_info)
+        log.debug("Added entity: %s", entity_info)
+
+
+class NewsAgenciesPipeline:
+    """
+    High-level wrapper that batches texts, invokes ChunkAwareTokenClassification,
+    and assembles final output with summary and wikidata links.
+    """
+
+    def __init__(
+        self,
+        model_id: str = "impresso-project/ner-newsagency-bert-multilingual",
+        min_relevance: float = 0.1,
+    ):
+        log.info("Initializing NewsAgenciesPipeline with model: %s", model_id)
+        log.debug("Min relevance threshold: %s", min_relevance)
+
+        config = AutoConfig.from_pretrained(model_id)
+        log.debug("Loaded config: %s", config.name_or_path)
+        log.debug("Model supports %s entity labels", len(config.id2label))
+        log.debug("Labels: %s", list(config.id2label.values()))
+
+        model = NewsAgencyTokenClassifier.from_pretrained(model_id, config=config)
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        log.debug("Model max length: %s", tokenizer.model_max_length)
+
+        device = (
+            0
+            if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available() else -1
+        )
+        if torch.cuda.is_available():
+            mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            log.info("Using GPU: %s (%.1f GB)", torch.cuda.get_device_name(), mem_gb)
+        else:
+            log.info("Using device: %s", device)
+
+        self.ner = ChunkAwareTokenClassification(
+            model=model,
+            tokenizer=tokenizer,
+            min_score=min_relevance,  # Use the same threshold as pipeline
+            device=device,
+        )
+        log.info("Pipeline initialization complete")
+
+    def __call__(
+        self,
+        input_texts: Union[str, List[str]],
+        min_relevance: float = 0.1,
+        diagnostics: bool = False,
+        suppress_entities: Optional[Sequence[str]] = None,
+        batch_size: int = 8,
+        text_ids: Optional[Union[str, List[str]]] = None,
+    ) -> Union[Tuple[Dict[str, Any], int], Tuple[List[Dict[str, Any]], int]]:
+        # Track if we need to return single result
+        return_single = isinstance(input_texts, str)
+
+        # Always normalize to lists
+        if isinstance(input_texts, str):
+            input_texts = [input_texts]
+
+        # Normalize text_ids
+        if text_ids is None:
+            text_ids = [f"text_{i}" for i in range(len(input_texts))]
+        elif isinstance(text_ids, str):
+            text_ids = [text_ids]
+
+        log.debug(
+            "Processing %s text(s), return_single=%s", len(input_texts), return_single
+        )
+        log.debug("Min relevance: %s, diagnostics: %s", min_relevance, diagnostics)
+
+        # Log text lengths for debugging
+        text_lengths = [len(text) for text in input_texts]
+        log.debug("Text lengths: %s", text_lengths)
+
+        # Prepare suppression set
+        if suppress_entities is None:
+            suppress_entities = []
+        suppress_set = list(suppress_entities) + [
+            "org.ent.pressagency.unk",
+            "ag",
+            "pers.ind.articleauthor",
+        ]
+        SUPPRESS = frozenset(suppress_set)
+        log.debug("Suppressing %s entity types: %s", len(SUPPRESS), list(SUPPRESS))
+
+        # Run batch-aware NER
+        log.debug("Starting NER processing...")
+        raw_entities, actual_chunks = self.ner(input_texts, text_ids=text_ids)
+
+        # Handle case where all texts were empty
+        if not raw_entities:
+            log.debug("No entities returned (all texts were empty)")
+            if return_single:
+                return {"agencies": []}, 0
+            else:
+                return [], 0
+
+        entity_counts = [len(ents) for ents in raw_entities]
+        log.debug("NER processing complete. Found entities per text: %s", entity_counts)
+
+        # Since we filtered out empty texts, we need to filter input_texts too
+        # to match the raw_entities results
+        non_empty_input_texts = [text for text in input_texts if len(text.strip()) > 0]
+
+        # Postprocess each text
+        outputs = [
+            self._postprocess(ents, text, diagnostics, SUPPRESS)
+            for ents, text in zip(raw_entities, non_empty_input_texts)
+        ]
+
+        # Log final results
+        if return_single:
+            result = outputs[0]
+            agency_count = len(result.get("agencies", []))
+            log.debug("Final result: %s agencies found", agency_count)
+        else:
+            agency_counts = [len(output.get("agencies", [])) for output in outputs]
+            log.debug("Final results: %s agencies found per text", agency_counts)
+
+        if return_single:
+            return outputs[0], actual_chunks
+        else:
+            return outputs, actual_chunks
+
+    def _postprocess(
+        self,
+        entities: List[Dict[str, Any]],
+        input_text: str,
+        diagnostics: bool,
+        SUPPRESS: frozenset,
+    ) -> Dict[str, Any]:
+        log.debug("Postprocessing %s raw entities", len(entities))
+        log.debug("Input text length: %s characters", len(input_text))
+        log.debug("Diagnostics mode: %s", diagnostics)
+
+        # Debug: Log all raw entities to see what we're getting
+        if entities:
+            log.debug("Raw entities sample (first 3): %s", entities[:3])
+            unique_labels = set(ent["entity"] for ent in entities)
+            log.debug("Unique entity labels found: %s", unique_labels)
+
+        # Merge B/I tokens into entities
+        merged: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+        suppressed_count = 0
+
+        for tok in entities:
+            entity_label = tok["entity"]
+
+            # Handle different IOB formats
+            if "-" in entity_label:
+                iob, base = entity_label.split("-", 1)
+            else:
+                # Fallback: assume no IOB tagging, treat as B-tag
+                iob = "B"
+                base = entity_label
+
+            if base in SUPPRESS:
+                suppressed_count += 1
+                log.debug("Suppressing entity type: %s", base)
+                continue
+            if iob == "B":
+                if current:
+                    merged.append(current)
+                start, stop = tok["start"], tok["stop"]
+                current = {
+                    "surface": input_text[start:stop],
+                    "entity": base,
+                    "start": start,
+                    "stop": stop,
+                    "relevance": round(tok["score"], 3),
+                }
+                log.debug("Starting new entity: %s at [%s:%s]", base, start, stop)
+            elif iob == "I" and current and current["entity"] == base:
+                stop = tok["stop"]
+                current["surface"] = input_text[current["start"] : stop]
+                current["stop"] = stop
+                current["relevance"] = round(max(current["relevance"], tok["score"]), 3)
+                log.debug("Extending entity to [%s:%s]", current["start"], stop)
+        if current:
+            merged.append(current)
+
+        log.debug(
+            "Merged into %s entities, suppressed %s", len(merged), suppressed_count
+        )
+
+        # Build summary
+        summary_dict: Dict[str, float] = {}
+        for ent in merged:
+            summary_dict[ent["entity"]] = max(
+                summary_dict.get(ent["entity"], 0.0), ent["relevance"]
+            )
+        summary = [
+            {"uid": uid, "relevance": relevance}
+            for uid, relevance in sorted(
+                summary_dict.items(), key=lambda x: x[1], reverse=True
+            )
+        ]
+
+        log.debug("Created summary with %s unique entities", len(summary))
+
+        # Attach wikidata links
+        for agency in merged:
+            agency["wikidata_link"] = AGENCY_LINKS.get(
+                agency["entity"].replace("org.ent.pressagency.", ""), None
+            )
+        for agency in summary:
+            agency["wikidata_link"] = AGENCY_LINKS.get(
+                agency["uid"].replace("org.ent.pressagency.", ""), None
+            )
+
+        if diagnostics:
+            # Rename 'entity' → 'uid' in diagnostics
+            merged = [
+                {("uid" if k == "entity" else k): v for k, v in a.items()}
+                for a in merged
+            ]
+            log.debug("Returning diagnostic output with full entity details")
+            return {"agencies": merged}
+
+        log.debug("Returning summary output")
+        return {"agencies": summary}
 
 
 def parse_arguments(args: Optional[List[str]] = None) -> argparse.Namespace:
@@ -46,7 +608,7 @@ def parse_arguments(args: Optional[List[str]] = None) -> argparse.Namespace:
         argparse.Namespace: Parsed arguments
     """
     parser = argparse.ArgumentParser(
-        description="News Agencies NER CLI script using impresso_pipelines.newsagencies."
+        description="News Agencies NER CLI script with adaptive chunk-aware batching."
     )
     parser.add_argument(
         "--log-file", dest="log_file", help="Write log to FILE", metavar="FILE"
@@ -72,60 +634,52 @@ def parse_arguments(args: Optional[List[str]] = None) -> argparse.Namespace:
         required=True,
     )
     parser.add_argument(
-        "--batch-size",
+        "--target-chunks",
         type=int,
-        default=8,
-        help="Batch size for processing texts (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--min-relevance",
-        type=float,
-        default=0.1,
-        help="Minimum relevance threshold for entities (default: %(default)s)",
+        default=16,
+        help=(
+            "Target number of chunks per batch for GPU memory optimization "
+            "(default: %(default)s)"
+        ),
     )
     return parser.parse_args(args)
 
 
-class NewsAgencyProcessorV2:
+class NewsAgencyProcessor:
     """
-    A processor class that uses the external NewsAgenciesPipeline to extract entities from text.
+    A processor class that uses the NewsAgenciesPipeline to extract entities from text.
     """
 
     def __init__(
         self,
         input_file: str,
         output_file: str,
-        batch_size: int = 8,
-        min_relevance: float = 0.1,
+        target_chunks: int = 16,
         log_level: str = "INFO",
         log_file: Optional[str] = None,
     ) -> None:
         """
-        Initializes the NewsAgencyProcessorV2 with explicit parameters.
+        Initializes the NewsAgencyProcessor with explicit parameters.
 
         Args:
             input_file (str): Path to the input file
             output_file (str): Path to the output file
-            batch_size (int): Batch size for processing texts (default: 8)
-            min_relevance (float): Minimum relevance threshold (default: 0.1)
+            target_chunks (int): Target number of chunks per batch (default: 16)
             log_level (str): Logging level (default: "INFO")
             log_file (Optional[str]): Path to log file (default: None)
         """
         self.input_file = input_file
         self.output_file = output_file
-        self.batch_size = batch_size
-        self.min_relevance = min_relevance
+        self.target_chunks = target_chunks
         self.log_level = log_level
         self.log_file = log_file
 
         # Configure the module-specific logger
         setup_logging(self.log_level, self.log_file, logger=log)
 
-        log.info("Initializing NewsAgencyProcessorV2: %s -> %s", input_file, output_file)
+        log.info("Initializing NewsAgencyProcessor: %s -> %s", input_file, output_file)
         log.debug("Log level: %s", log_level)
         log.debug("Log file: %s", log_file)
-        log.debug("Batch size: %s", batch_size)
-        log.debug("Min relevance: %s", min_relevance)
 
         # Initialize timestamp
         self.timestamp = get_timestamp()
@@ -133,27 +687,81 @@ class NewsAgencyProcessorV2:
 
         log.debug("Initializing NewsAgenciesPipeline...")
         self.pipeline = NewsAgenciesPipeline()
-        log.info("NewsAgencyProcessorV2 ready")
+        log.info("NewsAgencyProcessor ready")
 
     def run(self) -> None:
         """
-        Runs the processor with batch processing for optimal utilization.
+        Runs the processor with length-based batching for optimal GPU utilization.
         """
+        import time
+
         start_time = time.time()
         log.info(
             "Starting file processing: %s -> %s", self.input_file, self.output_file
         )
-        log.info("Using batch processing with batch_size=%s", self.batch_size)
+        log.info("Using chunk-aware batching with target_chunks=%s", self.target_chunks)
+
+        target_chunks = self.target_chunks  # Use configurable target chunks
 
         line_count = 0
         processed_count = 0
         skipped_count = 0
+        total_chunks_processed = 0
 
         # Track entity types across all processed texts
         entity_type_counts = {}  # entity_type -> count
 
+        # Adaptive estimation - learns from actual tokenization results
+        estimation_history = []  # Store (char_count, actual_chunks) pairs
+        chars_per_token_ratio = 4.0  # Starting conservative estimate for French OCR
+
+        def estimate_tokens(text: str) -> int:
+            """Adaptive estimate based on observed char/token ratios for French OCR"""
+            return int(len(text) / chars_per_token_ratio) + 10  # +10 for special tokens
+
+        def estimate_chunks(text: str) -> int:
+            """Estimate number of chunks this text will create"""
+            tokens = estimate_tokens(text)
+            if tokens <= 512:
+                return 1
+            # Account for stride overlap when calculating chunks
+            return ((tokens - 512) // (512 - 64)) + 1
+
+        def update_estimation(char_count: int, actual_chunks: int) -> None:
+            """Update estimation parameters based on actual results"""
+            nonlocal chars_per_token_ratio, estimation_history
+
+            # Store recent history (keep last 50 samples)
+            estimation_history.append((char_count, actual_chunks))
+            if len(estimation_history) > 50:
+                estimation_history.pop(0)
+
+            # Calculate actual chars per chunk from recent samples
+            if len(estimation_history) >= 5:  # Need minimum samples
+                total_chars = sum(chars for chars, _ in estimation_history)
+                total_chunks = sum(chunks for _, chunks in estimation_history)
+
+                if total_chunks > 0:
+                    # Estimate chars per chunk, then derive chars per token
+                    chars_per_chunk = total_chars / total_chunks
+                    # Each chunk ~= 448 effective tokens (512 - 64 overlap)
+                    new_ratio = chars_per_chunk / 448
+
+                    # Smooth the update to avoid oscillation
+                    chars_per_token_ratio = (
+                        0.8 * chars_per_token_ratio + 0.2 * new_ratio
+                    )
+
+                    log.debug(
+                        "Updated estimation: %.2f chars/token "
+                        "(from %s samples, %.1f chars/chunk)",
+                        chars_per_token_ratio,
+                        len(estimation_history),
+                        chars_per_chunk,
+                    )
+
         def process_batch(batch_items):
-            nonlocal processed_count, skipped_count, entity_type_counts
+            nonlocal processed_count, skipped_count, total_chunks_processed, entity_type_counts
             if not batch_items:
                 return
 
@@ -162,48 +770,56 @@ class NewsAgencyProcessorV2:
             batch_data = [{"content_id": item["content_id"]} for item in batch_items]
 
             batch_len = len(batch_texts)
-            text_lengths = [len(text) for text in batch_texts]
-            total_chars = sum(text_lengths)
-            max_chars = max(text_lengths)
+            estimated_chunks = [estimate_chunks(text) for text in batch_texts]
+            total_chunks = sum(estimated_chunks)
+            max_tokens = max(estimate_tokens(text) for text in batch_texts)
 
             log.info(
-                "🔄 Processing batch of %s texts (total: %s chars, max: %s chars)",
+                "🔄 Processing batch of %s texts → %s estimated chunks (max_tokens=%s)",
                 batch_len,
-                total_chars,
-                max_chars,
+                total_chunks,
+                max_tokens,
             )
 
-            # Process batch through external pipeline
+            # Process batch through pipeline
             batch_start_time = time.time()
-            
-            # Call the external pipeline with the batch of texts
-            results = self.pipeline(
-                input_texts=batch_texts,
-                min_relevance=self.min_relevance,
-                diagnostics=True,  # Get detailed results like the original script
+            results, actual_chunks = self.pipeline(
+                input_texts=batch_texts, diagnostics=True, text_ids=batch_ids
             )
-            
             batch_end_time = time.time()
+
+            # Track total chunks processed
+            total_chunks_processed += actual_chunks
+
+            # Calculate batch timing
             batch_duration = batch_end_time - batch_start_time
+            chunks_per_second = (
+                actual_chunks / batch_duration if batch_duration > 0 else 0
+            )
 
             log.info(
-                "⏱️  Batch completed in %.2fs (%.1f texts/sec)",
+                "⏱️  Batch completed in %.2fs (%.1f chunks/sec, %.1fms per chunk)",
                 batch_duration,
-                batch_len / batch_duration if batch_duration > 0 else 0,
+                chunks_per_second,
+                (batch_duration * 1000) / actual_chunks if actual_chunks > 0 else 0,
             )
 
-            # Handle the pipeline results - it might return a tuple or just results
-            if isinstance(results, tuple):
-                batch_results = results[0]  # Get the actual results from tuple
-            else:
-                batch_results = results
+            # Update estimation based on actual results
+            total_chars = sum(len(text) for text in batch_texts)
+            update_estimation(total_chars, actual_chunks)
 
-            # Ensure we have a list of results matching our batch
-            if not isinstance(batch_results, list):
-                batch_results = [batch_results]  # Single result to list
+            # Log estimation accuracy
+            if total_chunks != actual_chunks:
+                accuracy = (1 - abs(total_chunks - actual_chunks) / actual_chunks) * 100
+                log.debug(
+                    "Estimation accuracy: %.1f%% (predicted %s, actual %s chunks)",
+                    accuracy,
+                    total_chunks,
+                    actual_chunks,
+                )
 
             # Write results for texts that have agencies
-            for result, data in zip(batch_results, batch_data):
+            for result, data in zip(results, batch_data):
                 agencies_found = len(result.get("agencies", []))
                 log.debug(
                     "Found %s agencies for %s", agencies_found, data["content_id"]
@@ -212,13 +828,15 @@ class NewsAgencyProcessorV2:
                 if result.get("agencies"):
                     # Count entity types for statistics
                     for agency in result.get("agencies", []):
-                        entity_type = agency.get("uid", agency.get("entity", "unknown"))
+                        entity_type = agency.get("uid", "unknown")
                         entity_type_counts[entity_type] = (
                             entity_type_counts.get(entity_type, 0) + 1
                         )
-		    
-		    result.pop("text", None)
+
+                    # Remove the text field from the result before writing
+                    
                     result["ts"] = self.timestamp
+                    result.pop("text", None)
                     result["id"] = data["content_id"]
                     log.debug("Writing result for content %s", data["content_id"])
                     output_stream.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -227,7 +845,7 @@ class NewsAgencyProcessorV2:
                     log.debug("No agencies found for %s, skipping", data["content_id"])
                     skipped_count += 1
 
-        # Read all data and process in batches
+        # Read all data at once and sort by text length
         log.info("Reading all data from %s...", self.input_file)
         all_items = []
 
@@ -271,6 +889,13 @@ class NewsAgencyProcessorV2:
                 line_count,
                 len(all_items),
             )
+            log.info(
+                "Sorting %s items by text length for optimal batching...",
+                len(all_items),
+            )
+
+            # Sort all items by text length for optimal GPU batching
+            all_items.sort(key=lambda x: x["length"])
 
             # Log length distribution
             if all_items:
@@ -284,10 +909,10 @@ class NewsAgencyProcessorV2:
                     median_len,
                 )
 
-            log.info("🚀 STARTING BATCH PROCESSING")
-            log.info("Batch size: %s", self.batch_size)
+            log.info("🚀 ENTERING CHUNK-AWARE BATCHING SECTION")
+            log.info("Target chunks per batch: %s", target_chunks)
 
-            # Process all items in batches
+            # Process all items in chunk-aware batches
             with smart_open(
                 self.output_file,
                 "w",
@@ -295,10 +920,15 @@ class NewsAgencyProcessorV2:
                 transport_params=get_transport_params(self.output_file),
             ) as output_stream:
                 current_batch = []
+                current_chunks = 0
                 batch_count = 0
 
+                log.info(
+                    "Starting chunk-aware batching with target=%s chunks", target_chunks
+                )
+
                 for i, item in enumerate(all_items):
-                    current_batch.append(item)
+                    item_chunks = estimate_chunks(item["text"])
 
                     if i % 1000 == 0 and i > 0:
                         log.debug(
@@ -308,29 +938,37 @@ class NewsAgencyProcessorV2:
                             batch_count,
                         )
 
-                    # Process when batch is full
-                    if len(current_batch) >= self.batch_size:
+                    # If adding this item would exceed target chunks, process current batch
+                    if current_batch and current_chunks + item_chunks > target_chunks:
                         batch_count += 1
                         log.debug(
-                            "Batch %s: %s texts",
+                            "Batch %s: %s texts → %s chunks (would be %s with next"
+                            " item)",
                             batch_count,
                             len(current_batch),
+                            current_chunks,
+                            current_chunks + item_chunks,
                         )
                         process_batch(current_batch)
-                        current_batch = []
+                        current_batch = [item]
+                        current_chunks = item_chunks
+                    else:
+                        current_batch.append(item)
+                        current_chunks += item_chunks
 
                 # Process final batch if any items remain
                 if current_batch:
                     batch_count += 1
                     log.info(
-                        "🏁 FINAL BATCH: batch %s with %s texts",
+                        "🏁 FINAL BATCH: batch %s with %s texts → %s chunks",
                         batch_count,
                         len(current_batch),
+                        current_chunks,
                     )
                     process_batch(current_batch)
 
                 log.info(
-                    "Completed processing %s items in %s batches",
+                    "Completed processing %s items in %s chunk-aware batches",
                     len(all_items),
                     batch_count,
                 )
@@ -342,8 +980,11 @@ class NewsAgencyProcessorV2:
         # Calculate final timing metrics
         end_time = time.time()
         total_duration = end_time - start_time
-        items_per_second = (
-            len(all_items) / total_duration if total_duration > 0 else 0
+        avg_time_per_chunk = (
+            total_duration / total_chunks_processed if total_chunks_processed > 0 else 0
+        )
+        chunks_per_second = (
+            total_chunks_processed / total_duration if total_duration > 0 else 0
         )
 
         final_msg = "Processing complete: %s lines total, %s processed, %s skipped" % (
@@ -371,24 +1012,24 @@ class NewsAgencyProcessorV2:
 
         log.info("📊 PERFORMANCE SUMMARY:")
         log.info("   Total processing time: %.2f seconds", total_duration)
-        log.info("   Total items processed: %s", len(all_items))
-        log.info("   Overall throughput: %.1f items/second", items_per_second)
+        log.info("   Total chunks processed: %s", total_chunks_processed)
+        log.info("   Average time per chunk: %.2f ms", avg_time_per_chunk * 1000)
+        log.info("   Overall throughput: %.1f chunks/second", chunks_per_second)
 
 
 def main(args: Optional[List[str]] = None) -> None:
     """
-    Main function to run the NewsAgencyProcessorV2.
+    Main function to run the NewsAgencyProcessor.
 
     Args:
         args: Command-line arguments (uses sys.argv if None)
     """
     options: argparse.Namespace = parse_arguments(args)
 
-    processor: NewsAgencyProcessorV2 = NewsAgencyProcessorV2(
+    processor: NewsAgencyProcessor = NewsAgencyProcessor(
         input_file=options.input,
         output_file=options.output,
-        batch_size=options.batch_size,
-        min_relevance=options.min_relevance,
+        target_chunks=options.target_chunks,
         log_level=options.log_level,
         log_file=options.log_file,
     )
