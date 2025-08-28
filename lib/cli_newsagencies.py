@@ -131,9 +131,10 @@ class NewsAgencyProcessorV2:
         self.timestamp = get_timestamp()
         log.debug("Processing timestamp: %s", self.timestamp)
 
-        log.debug("Initializing NewsAgenciesPipeline...")
+        log.info("🔌 Initializing external NewsAgenciesPipeline from impresso_pipelines.newsagencies...")
+        log.debug("📦 Using external package: impresso_pipelines.newsagencies.NewsAgenciesPipeline")
         self.pipeline = NewsAgenciesPipeline()
-        log.info("NewsAgencyProcessorV2 ready")
+        log.info("✅ External NewsAgenciesPipeline ready - all NER processing will be handled externally")
 
     def run(self) -> None:
         """
@@ -141,7 +142,7 @@ class NewsAgencyProcessorV2:
         """
         start_time = time.time()
         log.info(
-            "Starting file processing: %s -> %s", self.input_file, self.output_file
+            "🚀 STARTING PROCESSING: %s -> %s", self.input_file, self.output_file
         )
         log.info("Using batch processing with batch_size=%s", self.batch_size)
 
@@ -172,10 +173,12 @@ class NewsAgencyProcessorV2:
                 total_chars,
                 max_chars,
             )
+            log.debug("📝 Batch content IDs: %s", batch_ids)
 
             # Process batch through external pipeline
             batch_start_time = time.time()
             
+            log.info("🧠 Running NewsAgenciesPipeline on current batch...")
             # Call the external pipeline with the batch of texts
             results = self.pipeline(
                 input_texts=batch_texts,
@@ -202,11 +205,14 @@ class NewsAgencyProcessorV2:
             if not isinstance(batch_results, list):
                 batch_results = [batch_results]  # Single result to list
 
+            log.info("📊 Processing results for %s items in batch...", len(batch_results))
             # Write results for texts that have agencies
-            for result, data in zip(batch_results, batch_data):
+            for idx, (result, data) in enumerate(zip(batch_results, batch_data)):
+                content_id = data["content_id"]
                 agencies_found = len(result.get("agencies", []))
                 log.debug(
-                    "Found %s agencies for %s", agencies_found, data["content_id"]
+                    "📄 [%s/%s] Processing %s: %s agencies found", 
+                    idx + 1, len(batch_results), content_id, agencies_found
                 )
 
                 if result.get("agencies"):
@@ -222,15 +228,15 @@ class NewsAgencyProcessorV2:
                     result["ts"] = self.timestamp
                     
                     result["id"] = data["content_id"]
-                    log.debug("Writing result for content %s", data["content_id"])
+                    log.debug("✅ Writing result for content %s", data["content_id"])
                     output_stream.write(json.dumps(result, ensure_ascii=False) + "\n")
                     processed_count += 1
                 else:
-                    log.debug("No agencies found for %s, skipping", data["content_id"])
+                    log.debug("⏭️  No agencies found for %s, skipping", data["content_id"])
                     skipped_count += 1
 
         # Read all data and process in batches
-        log.info("Reading all data from %s...", self.input_file)
+        log.info("📖 Reading all data from %s...", self.input_file)
         all_items = []
 
         try:
@@ -248,7 +254,7 @@ class NewsAgencyProcessorV2:
 
                     # Skip empty texts immediately at input stage
                     if len(input_text.strip()) == 0:
-                        log.debug("Skipping empty text for %s", content_id)
+                        log.debug("⏭️  Skipping empty text for %s", content_id)
                         skipped_count += 1
                         continue
 
@@ -263,13 +269,13 @@ class NewsAgencyProcessorV2:
 
                     if line_count % 10000 == 0:
                         log.info(
-                            "Read %s lines, collected %s valid items",
+                            "📖 Read %s lines, collected %s valid items",
                             line_count,
                             len(all_items),
                         )
 
             log.info(
-                "Completed reading %s lines, collected %s valid items",
+                "✅ Completed reading %s lines, collected %s valid items",
                 line_count,
                 len(all_items),
             )
@@ -280,14 +286,16 @@ class NewsAgencyProcessorV2:
                 min_len, max_len = min(lengths), max(lengths)
                 median_len = lengths[len(lengths) // 2]
                 log.info(
-                    "Text length range: %s - %s chars (median: %s)",
+                    "📏 Text length range: %s - %s chars (median: %s)",
                     min_len,
                     max_len,
                     median_len,
                 )
 
             log.info("🚀 STARTING BATCH PROCESSING")
-            log.info("Batch size: %s", self.batch_size)
+            log.info("⚙️  Batch size: %s", self.batch_size)
+            total_batches_expected = (len(all_items) + self.batch_size - 1) // self.batch_size
+            log.info("📊 Expected total batches: %s", total_batches_expected)
 
             # Process all items in batches
             with smart_open(
@@ -303,19 +311,22 @@ class NewsAgencyProcessorV2:
                     current_batch.append(item)
 
                     if i % 1000 == 0 and i > 0:
-                        log.debug(
-                            "Processed %s/%s items (%s batches so far)",
+                        progress_pct = (i / len(all_items)) * 100
+                        log.info(
+                            "🔄 Progress: %s/%s items (%.1f%%) - %s batches completed",
                             i,
                             len(all_items),
+                            progress_pct,
                             batch_count,
                         )
 
                     # Process when batch is full
                     if len(current_batch) >= self.batch_size:
                         batch_count += 1
-                        log.debug(
-                            "Batch %s: %s texts",
+                        log.info(
+                            "🎯 BATCH %s/%s: Processing %s texts",
                             batch_count,
+                            total_batches_expected,
                             len(current_batch),
                         )
                         process_batch(current_batch)
@@ -325,20 +336,21 @@ class NewsAgencyProcessorV2:
                 if current_batch:
                     batch_count += 1
                     log.info(
-                        "🏁 FINAL BATCH: batch %s with %s texts",
+                        "🏁 FINAL BATCH %s/%s: Processing %s texts",
                         batch_count,
+                        total_batches_expected,
                         len(current_batch),
                     )
                     process_batch(current_batch)
 
                 log.info(
-                    "Completed processing %s items in %s batches",
+                    "✅ Completed processing %s items in %s batches",
                     len(all_items),
                     batch_count,
                 )
 
         except Exception as e:
-            log.error("Error processing file: %s", e, exc_info=True)
+            log.error("❌ Error processing file: %s", e, exc_info=True)
             sys.exit(1)
 
         # Calculate final timing metrics
