@@ -48,15 +48,16 @@ The pipeline is derived from the `impresso-make-cookbook` template and follows i
 
 **`lib/cli_newsagencies.py`** is the main Python entry point. Key components:
 
-| Class / Function                | Purpose                                                                                                                                  |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `NewsAgencyTokenClassifier`     | Custom `PreTrainedModel` wrapping a multilingual BERT backbone with a token classification head                                          |
-| `ChunkAwareTokenClassification` | `Pipeline` subclass that splits long texts into overlapping 512-token chunks (stride 64) and reassembles results                         |
-| `NewsAgenciesPipeline`          | Batch-optimised pipeline: sorts texts by length, groups into batches targeting `--target-chunks` GPU chunks, processes with CUDA/MPS/CPU |
-| `main()`                        | CLI entry point; reads `.jsonl.bz2` from local path or S3 URI, writes annotated `.jsonl.bz2` output                                      |
+| Class / Function                  | Purpose                                                                                                                        |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `NewsAgencyProcessorV2`           | Main processor: reads a `.jsonl.bz2` input file in batches, calls the external pipeline, writes annotated output               |
+| `NewsAgenciesPipeline` (external) | Imported from `impresso_pipelines.newsagencies`; handles all NER and Wikidata linking internally                               |
+| `NewsAgencyTokenClassifier`       | Custom `PreTrainedModel` (BERT backbone + token classification head) — kept for reference, not used by `NewsAgencyProcessorV2` |
+| `ChunkAwareTokenClassification`   | `Pipeline` subclass with 512-token/stride-64 chunking — kept for reference, not used by `NewsAgencyProcessorV2`                |
+| `main()`                          | CLI entry point; instantiates `NewsAgencyProcessorV2` and calls `.run()`                                                       |
 
-**Model**: `impresso-project/ner-newsagency-bert-multilingual` (multilingual BERT, token classification)  
-**Output**: Each article gets a `newsagency` field containing a list of detected entities with `wikidata_id`, `surface`, `offset`, and confidence score.
+**Model**: `impresso-project/ner-newsagency-bert-multilingual` (multilingual BERT, token classification), loaded by the external `impresso_pipelines` package.  
+**Output**: Each article that contains at least one agency is written as a JSON line with an `agencies` list (each entry has `wikidata_id`, `surface`, `offset`, and relevance score) plus a `ts` timestamp and `id` field.
 
 ---
 
@@ -67,6 +68,7 @@ The pipeline is derived from the `impresso-make-cookbook` template and follows i
 | Variable                   | Default                                    | Description                                |
 | -------------------------- | ------------------------------------------ | ------------------------------------------ |
 | `NEWSPAPER`                | _(required)_                               | Newspaper ID to process (e.g. `GDL`)       |
+| `S3_BUCKET_REBUILT`        | `122-rebuilt-final`                        | Input S3 bucket (rebuilt content)          |
 | `S3_BUCKET_newsagencies`   | `140-processed-data-sandbox`               | Output S3 bucket                           |
 | `MODEL_ID_NEWSAGENCIES`    | `ner-newsagency-bert-multilingual_0b5d750` | Model identifier used in output paths      |
 | `RUN_VERSION_NEWSAGENCIES` | `v1-0-0`                                   | Run version string                         |
@@ -140,7 +142,7 @@ Key packages: `torch`, `transformers`, `smart-open[s3,http]`, `boto3==1.35.95`, 
 
 - **Never edit cookbook `*.mk` files** unless fixing a bug that applies to all pipelines. Pipeline-specific logic belongs in `cookbook/paths_newsagencies.mk`, `cookbook/processing_newsagencies.mk`, `cookbook/sync_newsagencies.mk`, and `cookbook/setup_newsagencies.mk`.
 - **`config.local.mk`** is the correct place for local overrides (S3 buckets, paths, model variants). It is git-ignored.
-- **Stamp files** (`.jsonl.bz2.stamp` by default) are the Make dependency mechanism — they mirror the S3 object tree locally without downloading actual data.
+- **Stamp files**: rebuilt input files are synced as exact-name local stubs (`.jsonl.bz2`, no extra suffix). They mirror the S3 object tree locally without downloading actual content and serve as Make dependency triggers.
 - **Output paths** are derived deterministically from `PROCESS_LABEL`, `TASK`, `MODEL_ID`, and `RUN_VERSION` variables, producing a `RUN_ID` like `newsagency-nel-ner-newsagency-bert-multilingual_0b5d750_v1-0-0`.
 - **Type checking**: run `mypy lib/` (config in `mypy.ini`) and `pyright` (config in `pyrightconfig.json`) before committing Python changes.
 - All Python files use `impresso_cookbook.setup_logging()` for log configuration — do not use `logging.basicConfig()` directly.
