@@ -96,8 +96,9 @@ brew install make git git-lfs parallel coreutils python3
 
    ```bash
    # Using pipenv (recommended)
+   export PIPENV_VENV_IN_PROJECT=enabled
    pipenv install
-
+   
    # Or using pip directly
    python3 -m pip install -r requirements.txt
    ```
