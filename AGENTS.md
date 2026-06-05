@@ -17,7 +17,8 @@ The pipeline is derived from the `impresso-make-cookbook` template and follows i
 ├── dotenv.sample                   # Template for .env (S3 credentials)
 ├── mypy.ini / pyrightconfig.json   # Python type-checking config
 ├── config/
-│   └── config_v1-0-0.mk           # Versioned Make configuration overrides
+│   ├── config_v1-0-0.mk           # Run v1-0-0 configuration
+│   └── config_v1-1-0.mk           # Run v1-1-0 configuration (new model variant)
 ├── lib/
 │   ├── cli_newsagencies.py         # Main NER processing script
 │   └── cli_TEMPLATE.py             # Template for new CLI scripts
@@ -65,16 +66,17 @@ The pipeline is derived from the `impresso-make-cookbook` template and follows i
 
 ### Key Variables (set in `config.local.mk` or env)
 
-| Variable                   | Default                                    | Description                                |
-| -------------------------- | ------------------------------------------ | ------------------------------------------ |
-| `NEWSPAPER`                | _(required)_                               | Newspaper ID to process (e.g. `GDL`)       |
-| `S3_BUCKET_REBUILT`        | `122-rebuilt-final`                        | Input S3 bucket (rebuilt content)          |
-| `S3_BUCKET_newsagencies`   | `140-processed-data-sandbox`               | Output S3 bucket                           |
-| `MODEL_ID_NEWSAGENCIES`    | `ner-newsagency-bert-multilingual_0b5d750` | Model identifier used in output paths      |
-| `RUN_VERSION_NEWSAGENCIES` | `v1-0-0`                                   | Run version string                         |
-| `TASK_NEWSAGENCIES`        | `nel`                                      | Task label (`nel` = Named Entity Linking)  |
-| `COLLECTION_JOBS`          | `2`                                        | Number of newspapers processed in parallel |
-| `LOGGING_LEVEL`            | `INFO`                                     | Makefile and Python log verbosity          |
+| Variable                   | Default                                             | Description                                            |
+| -------------------------- | --------------------------------------------------- | ------------------------------------------------------ |
+| `NEWSPAPER`                | _(required)_                                        | Newspaper ID to process (e.g. `GDL`)                   |
+| `S3_BUCKET_REBUILT`        | `122-rebuilt-final`                                 | Input S3 bucket (rebuilt content)                      |
+| `S3_BUCKET_newsagencies`   | `140-processed-data-sandbox`                        | Output S3 bucket                                       |
+| `MODEL_ID_NEWSAGENCIES`    | `ner-newsagency-bert-multilingual_0b5d750`          | Path-safe S3 label: `<model-name>_<commit-short-hash>` |
+| `HF_MODEL_NEWSAGENCIES`    | `impresso-project/ner-newsagency-bert-multilingual` | HuggingFace model ID passed to `NewsAgenciesPipeline`  |
+| `RUN_VERSION_NEWSAGENCIES` | `v1-0-0`                                            | Run version string                                     |
+| `TASK_NEWSAGENCIES`        | `nel`                                               | Task label (`nel` = Named Entity Linking)              |
+| `COLLECTION_JOBS`          | `2`                                                 | Number of newspapers processed in parallel             |
+| `LOGGING_LEVEL`            | `INFO`                                              | Makefile and Python log verbosity                      |
 
 ### Essential Make Targets
 
@@ -140,6 +142,7 @@ Key packages: `torch`, `transformers`, `smart-open[s3,http]`, `boto3==1.35.95`, 
 
 ## Conventions & Constraints
 
+- **All Make variables use `?=`** (conditional assignment) so any variable can be overridden from the command line or `config.local.mk` without editing shared files.
 - **Never edit cookbook `*.mk` files** unless fixing a bug that applies to all pipelines. Pipeline-specific logic belongs in `cookbook/paths_newsagencies.mk`, `cookbook/processing_newsagencies.mk`, `cookbook/sync_newsagencies.mk`, and `cookbook/setup_newsagencies.mk`.
 - **`config.local.mk`** is the correct place for local overrides (S3 buckets, paths, model variants). It is git-ignored.
 - **Stamp files**: rebuilt input files are synced as exact-name local stubs (`.jsonl.bz2`, no extra suffix). They mirror the S3 object tree locally without downloading actual content and serve as Make dependency triggers.
@@ -151,7 +154,25 @@ Key packages: `torch`, `transformers`, `smart-open[s3,http]`, `boto3==1.35.95`, 
 
 ## Adding or Modifying Pipeline Logic
 
-1. **Change NER model or parameters** → edit `cookbook/paths_newsagencies.mk` (update `MODEL_ID_NEWSAGENCIES`, `RUN_VERSION_NEWSAGENCIES`, etc.)
+1. **Change NER model or parameters** → create a new versioned config in `config/` (e.g. `config_v1-2-0.mk`) setting `MODEL_ID_NEWSAGENCIES`, `HF_MODEL_NEWSAGENCIES`, and `RUN_VERSION_NEWSAGENCIES`; include it via `CONFIG_LOCAL_MAKE`
 2. **Change processing CLI arguments** → edit the recipe in `cookbook/processing_newsagencies.mk`
 3. **Add a new processing stage** → copy the four `_TEMPLATE.mk` files, rename, and include them from the top-level `Makefile`
 4. **Update Python NER logic** → edit `lib/cli_newsagencies.py`; run type checks and test with a small input file before committing
+
+### Running a New Model Version
+
+```makefile
+# config.local.mk
+CONFIG_LOCAL_MAKE := config/config_v1-1-0.mk
+```
+
+Or override on the command line:
+
+```bash
+make newspaper NEWSPAPER=GDL \
+  MODEL_ID_NEWSAGENCIES=my-new-model_c06430b \
+  HF_MODEL_NEWSAGENCIES=impresso-project/my-new-model@c06430ba \
+  RUN_VERSION_NEWSAGENCIES=v1-1-0
+```
+
+`MODEL_ID_NEWSAGENCIES` is the path-safe label embedded in the S3 output path; `HF_MODEL_NEWSAGENCIES` is the actual model reference passed to the pipeline. Keep them consistent: a short hash suffix in `MODEL_ID_NEWSAGENCIES` should match the revision in `HF_MODEL_NEWSAGENCIES`.

@@ -83,6 +83,12 @@ def parse_arguments(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=0.1,
         help="Minimum relevance threshold for entities (default: %(default)s)",
     )
+    parser.add_argument(
+        "--hf-model",
+        dest="hf_model",
+        default="impresso-project/ner-newsagency-bert-multilingual",
+        help="HuggingFace model ID to use for NewsAgenciesPipeline (default: %(default)s)",
+    )
     return parser.parse_args(args)
 
 
@@ -99,6 +105,7 @@ class NewsAgencyProcessorV2:
         min_relevance: float = 0.1,
         log_level: str = "INFO",
         log_file: Optional[str] = None,
+        hf_model: str = "impresso-project/ner-newsagency-bert-multilingual",
     ) -> None:
         """
         Initializes the NewsAgencyProcessorV2 with explicit parameters.
@@ -110,6 +117,7 @@ class NewsAgencyProcessorV2:
             min_relevance (float): Minimum relevance threshold (default: 0.1)
             log_level (str): Logging level (default: "INFO")
             log_file (Optional[str]): Path to log file (default: None)
+            hf_model (str): HuggingFace model ID for NewsAgenciesPipeline
         """
         self.input_file = input_file
         self.output_file = output_file
@@ -117,6 +125,7 @@ class NewsAgencyProcessorV2:
         self.min_relevance = min_relevance
         self.log_level = log_level
         self.log_file = log_file
+        self.hf_model = hf_model
 
         # Configure the module-specific logger
         setup_logging(self.log_level, self.log_file, logger=log)
@@ -133,7 +142,10 @@ class NewsAgencyProcessorV2:
 
         log.info("🔌 Initializing external NewsAgenciesPipeline from impresso_pipelines.newsagencies...")
         log.debug("📦 Using external package: impresso_pipelines.newsagencies.NewsAgenciesPipeline")
-        self.pipeline = NewsAgenciesPipeline()
+        log.info("🤗 HuggingFace model: %s", self.hf_model)
+        self.pipeline = NewsAgenciesPipeline(model_id=self.hf_model)
+        commit_hash = getattr(self.pipeline.model.config, "_commit_hash", "unknown")
+        log.info("🔖 Model commit hash: %s", commit_hash)
         log.info("✅ External NewsAgenciesPipeline ready - all NER processing will be handled externally")
 
     def run(self) -> None:
@@ -420,6 +432,7 @@ def main(args: Optional[List[str]] = None) -> None:
         min_relevance=options.min_relevance,
         log_level=options.log_level,
         log_file=options.log_file,
+        hf_model=options.hf_model,
     )
 
     # Log the parsed options after logger is configured

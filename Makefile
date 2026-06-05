@@ -1,4 +1,4 @@
-# Description: Makefile for template processing
+# Makefile for newsagencies processing
 # Read the README.md for more information on how to use this Makefile.
 # Or run `make` for online help.
 
@@ -43,7 +43,7 @@ help::
 include cookbook/make_settings.mk
 
 # If you need to use a different shell than /bin/dash, overwrite it here.
-# SHELL := /bin/bash
+# SHELL := /bin/dash
 
 
 
@@ -52,10 +52,9 @@ include cookbook/setup.mk
 include cookbook/setup_python.mk
 # for asw tool configuration if needed
 # include cookbook/setup_aws.mk
-# for newsagencies configuration, adapt to your needs
 include cookbook/setup_newsagencies.mk
 
-# Load newspaper list configuration and processing rules
+# Load newspaper list configuration
 include cookbook/newspaper_list.mk
 
 
